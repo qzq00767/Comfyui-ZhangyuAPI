@@ -1,12 +1,18 @@
 {
-  "last_node_id": 10,
-  "last_link_id": 3,
+  "last_node_id": 26,
+  "last_link_id": 19,
   "nodes": [
     {
       "id": 1,
       "type": "ComfyuiLuckGPT20Node",
-      "pos": [420, 180],
-      "size": [520, 560],
+      "pos": [
+        420,
+        180
+      ],
+      "size": [
+        520,
+        560
+      ],
       "flags": {},
       "order": 0,
       "mode": 0,
@@ -15,7 +21,9 @@
         {
           "name": "image",
           "type": "IMAGE",
-          "links": [1],
+          "links": [
+            1
+          ],
           "slot_index": 0
         },
         {
@@ -52,8 +60,14 @@
     {
       "id": 2,
       "type": "PreviewImage",
-      "pos": [1000, 180],
-      "size": [360, 360],
+      "pos": [
+        1000,
+        180
+      ],
+      "size": [
+        360,
+        360
+      ],
       "flags": {},
       "order": 1,
       "mode": 0,
@@ -70,21 +84,33 @@
     {
       "id": 3,
       "type": "Note",
-      "pos": [40, 60],
-      "size": [330, 320],
+      "pos": [
+        40,
+        60
+      ],
+      "size": [
+        360,
+        430
+      ],
       "flags": {},
       "order": 2,
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "【模型怎么选】\n\n1. Comfyui-Luck gpt-2.0 all\n   - gpt-image-2-all：$0.03/张，约 30-60 秒\n   - 不传真实 size，只把画幅写进 prompt\n\n2. Comfyui-Luck gpt-image-2-vip\n   - gpt-image-2-vip：$0.03/张，约 90-150 秒\n   - 用 image_size + aspect_ratio 传真实 size\n   - 例：2K Recommended + 16:9 = 2048x1152\n   - 4K Detail + 16:9 = 3840x2160\n\n3. Comfyui-Luck gpt-image-2\n   - 官转模型，支持 quality / custom / mask\n   - timeout 建议 360 秒\n\n分享工作流前请清空 API Key。"
+        "【模型怎么选】\n\n1. Comfyui-Luck gpt-2.0 all\n   - gpt-image-2-all：$0.03/张，约 30-60 秒\n   - 不传真实 size，只把画幅写进 prompt\n\n2. Comfyui-Luck gpt-image-2-vip\n   - gpt-image-2-vip：$0.03/张，约 90-150 秒\n   - 用 image_size + aspect_ratio 传真实 size\n\n3. Comfyui-Luck gpt-image-2\n   - 官转模型，支持 quality / custom / mask\n   - timeout 建议 360 秒\n\n4. 提示词控制器\n   - 默认 gemini-3.5-flash\n   - 可选 gpt-5.5 / gpt-4o / gpt-4.1-mini\n   - API Key 和接口域名与 Luck 出图节点一致\n\n分享工作流前请清空 API Key。"
       ]
     },
     {
       "id": 4,
       "type": "Note",
-      "pos": [40, 420],
-      "size": [330, 260],
+      "pos": [
+        40,
+        420
+      ],
+      "size": [
+        330,
+        260
+      ],
       "flags": {},
       "order": 3,
       "mode": 0,
@@ -96,8 +122,14 @@
     {
       "id": 5,
       "type": "Note",
-      "pos": [1000, 580],
-      "size": [360, 230],
+      "pos": [
+        1000,
+        580
+      ],
+      "size": [
+        360,
+        230
+      ],
       "flags": {},
       "order": 4,
       "mode": 0,
@@ -109,8 +141,14 @@
     {
       "id": 6,
       "type": "ComfyuiLuckGPTImage2Node",
-      "pos": [420, 820],
-      "size": [520, 620],
+      "pos": [
+        420,
+        820
+      ],
+      "size": [
+        520,
+        620
+      ],
       "flags": {},
       "order": 5,
       "mode": 0,
@@ -119,7 +157,9 @@
         {
           "name": "image",
           "type": "IMAGE",
-          "links": [2],
+          "links": [
+            2
+          ],
           "slot_index": 0
         },
         {
@@ -153,8 +193,14 @@
     {
       "id": 7,
       "type": "PreviewImage",
-      "pos": [1000, 820],
-      "size": [360, 360],
+      "pos": [
+        1000,
+        820
+      ],
+      "size": [
+        360,
+        360
+      ],
       "flags": {},
       "order": 6,
       "mode": 0,
@@ -171,8 +217,14 @@
     {
       "id": 9,
       "type": "ComfyuiLuckGPTImage2VipNode",
-      "pos": [420, 1500],
-      "size": [520, 590],
+      "pos": [
+        420,
+        1500
+      ],
+      "size": [
+        520,
+        590
+      ],
       "flags": {},
       "order": 7,
       "mode": 0,
@@ -181,7 +233,9 @@
         {
           "name": "image",
           "type": "IMAGE",
-          "links": [3],
+          "links": [
+            3
+          ],
           "slot_index": 0
         },
         {
@@ -219,8 +273,14 @@
     {
       "id": 10,
       "type": "PreviewImage",
-      "pos": [1000, 1500],
-      "size": [360, 360],
+      "pos": [
+        1000,
+        1500
+      ],
+      "size": [
+        360,
+        360
+      ],
       "flags": {},
       "order": 8,
       "mode": 0,
@@ -237,8 +297,14 @@
     {
       "id": 8,
       "type": "Note",
-      "pos": [40, 720],
-      "size": [330, 270],
+      "pos": [
+        40,
+        720
+      ],
+      "size": [
+        330,
+        270
+      ],
       "flags": {},
       "order": 9,
       "mode": 0,
@@ -246,12 +312,817 @@
       "widgets_values": [
         "【gpt-image-2 真尺寸控制】\n\n官方节点会真正传 size 参数。\n现在按 Nano 风格拆成两栏：\n- image_size：auto / 1K / 2K / 4K / custom\n- aspect_ratio：AUTO、1:4、4:1、1:8、8:1、1:1、2:3、3:2、3:4、4:3、4:5、5:4、9:16、16:9、21:9\n\n例：image_size=2K + aspect_ratio=4:3，会发送 size=2048x1536。\n例：image_size=4K + aspect_ratio=16:9，会发送 size=3840x2160。\n\n注意：gpt-image-2 官方限制长边/短边≤3:1，所以 1:4、4:1、1:8、8:1 会自动收敛到合法边界，不会硬传非法比例。\n\ncustom_size 只在选择 custom 时填写，格式如 1600x1200。约束：最大边≤3840，宽高16倍数，长边/短边≤3:1，总像素 0.65MP 到 8.3MP。"
       ]
+    },
+    {
+      "id": 11,
+      "type": "Note",
+      "pos": [
+        40,
+        1040
+      ],
+      "size": [
+        330,
+        360
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "【提示词控制器】\n\nGPT-Image-2 文生图提示词控制器：\n- 文字需求 -> 优化后的生图提示词\n- 默认 gemini-3.5-flash\n- 适合先增强 prompt，再接 gpt-image-2 出图\n\n图生图提示词控制器：\n- reference_image_01 必填\n- reference_image_02~05 可选，可最多 5 张参考图一起分析\n- subject_image 可选，用来锁定主体\n- 只接它：只做图像理解和提示词增强\n- 同时把图片接到后面出图节点：才是真正多图参考/多图融合\n\n模型下拉顺序：\ngemini-3.5-flash / gpt-5.5 / gpt-4o / gpt-4.1-mini / gemini-2.5-flash / gemini-2.5-pro"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "LuckGPTImage2PromptOptimizer",
+      "pos": [
+        420,
+        2180
+      ],
+      "size": [
+        560,
+        520
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "optimized_prompt",
+          "type": "STRING",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "debug_info",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LuckGPTImage2PromptOptimizer"
+      },
+      "widgets_values": [
+        "",
+        "https://api.apiyi.com",
+        "为一款高端白色陶瓷马克杯生成电商主图：干净背景，柔和自然光，突出质感，画面可加入简短中文标题“温润如玉”。",
+        "电商主图",
+        "保留原文",
+        "gemini-3.5-flash",
+        "标准",
+        "16:9",
+        0,
+        "randomize",
+        600,
+        "温润如玉"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "ComfyuiLuckGPTImage2Node",
+      "pos": [
+        1660,
+        2180
+      ],
+      "size": [
+        520,
+        620
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prompt (提示词)",
+          "type": "STRING",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "response",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ComfyuiLuckGPTImage2Node"
+      },
+      "widgets_values": [
+        "",
+        "",
+        "AUTO",
+        "gpt-image-2",
+        "https://api.apiyi.com",
+        "2K",
+        "16:9",
+        "1600x1200",
+        "high",
+        "jpeg",
+        85,
+        0,
+        "randomize",
+        360,
+        3
+      ]
+    },
+    {
+      "id": 14,
+      "type": "PreviewImage",
+      "pos": [
+        2240,
+        2180
+      ],
+      "size": [
+        360,
+        360
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        }
+      ],
+      "outputs": [],
+      "properties": {}
+    },
+    {
+      "id": 15,
+      "type": "LuckReferenceImagePromptOptimizer",
+      "pos": [
+        640,
+        3300
+      ],
+      "size": [
+        560,
+        620
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "reference_image_01",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "name": "reference_image_02",
+          "type": "IMAGE",
+          "link": 8
+        },
+        {
+          "name": "reference_image_03",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "name": "reference_image_04",
+          "type": "IMAGE",
+          "link": 12
+        },
+        {
+          "name": "reference_image_05",
+          "type": "IMAGE",
+          "link": 14
+        },
+        {
+          "name": "subject_image",
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "optimized_prompt",
+          "type": "STRING",
+          "links": [
+            16
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "reference_summary",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LuckReferenceImagePromptOptimizer"
+      },
+      "widgets_values": [
+        "",
+        "https://api.apiyi.com",
+        "综合参考 5 张图片的构图、光影、色彩、文字版式和共同视觉规律，并生成一条适合后面 gpt-image-2 多图生成的中文提示词。",
+        "自动判断",
+        "16:9",
+        "gemini-3.5-flash",
+        0,
+        "randomize",
+        600
+      ]
+    },
+    {
+      "id": 16,
+      "type": "LuckTextListEditor",
+      "pos": [
+        1040,
+        2180
+      ],
+      "size": [
+        520,
+        320
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_list",
+          "type": "STRING",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "edited_text",
+          "type": "STRING",
+          "links": [
+            18
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "edited_texts",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LuckTextListEditor"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 17,
+      "type": "Note",
+      "pos": [
+        40,
+        1440
+      ],
+      "size": [
+        330,
+        300
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "【文本停留编辑器】\n\n正确接法：\n提示词增强器 optimized_prompt -> 文本停留编辑器 text_list -> edited_text -> 出图节点 prompt。\n\nedited_text 是单条字符串，专门给普通 prompt 输入用。\nedited_texts 是列表输出，保留给批量文本工作流。\n\n点击 Continue 后，后面的出图节点才会继续执行。点击 Cancel 会中断当前执行。"
+      ]
+    },
+    {
+      "id": 25,
+      "type": "Note",
+      "pos": [
+        40,
+        2860
+      ],
+      "size": [
+        540,
+        330
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "【完整 5 图参考 -> 暂停编辑 -> 多图出图链路】\n\n下面 5 个 LoadImage 节点每张图都一拖二：\n1. 接到 图生图提示词控制器 reference_image_01~05，用来综合分析并生成 optimized_prompt。\n2. 同时接到 Comfyui-Luck gpt-image-2 的 image_01~05，用来让最终出图真实参考这 5 张图。\n\n正确执行链路：\n图生图提示词控制器 optimized_prompt -> 文本停留编辑器 text_list -> edited_text -> 后面出图节点 prompt。\n\n点击 Continue 只会放行当前等待中的流程，让后面的 gpt-image-2 继续生图；不要再次点击主运行按钮，否则会重新跑上游提示词增强。"
+      ]
+    },
+    {
+      "id": 18,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        3240
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            6,
+            7
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        3450
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            8,
+            9
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 20,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        3660
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            10,
+            11
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 21,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        3870
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            12,
+            13
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 22,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        4080
+      ],
+      "size": [
+        360,
+        200
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            14,
+            15
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 23,
+      "type": "ComfyuiLuckGPTImage2Node",
+      "pos": [
+        1860,
+        3300
+      ],
+      "size": [
+        540,
+        640
+      ],
+      "flags": {},
+      "order": 24,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prompt (提示词)",
+          "type": "STRING",
+          "link": 19
+        },
+        {
+          "name": "image_01",
+          "type": "IMAGE",
+          "link": 7
+        },
+        {
+          "name": "image_02",
+          "type": "IMAGE",
+          "link": 9
+        },
+        {
+          "name": "image_03",
+          "type": "IMAGE",
+          "link": 11
+        },
+        {
+          "name": "image_04",
+          "type": "IMAGE",
+          "link": 13
+        },
+        {
+          "name": "image_05",
+          "type": "IMAGE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            17
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "response",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ComfyuiLuckGPTImage2Node"
+      },
+      "widgets_values": [
+        "",
+        "",
+        "AUTO",
+        "gpt-image-2",
+        "https://api.apiyi.com",
+        "2K",
+        "16:9",
+        "1600x1200",
+        "high",
+        "jpeg",
+        85,
+        0,
+        "randomize",
+        360,
+        3
+      ]
+    },
+    {
+      "id": 24,
+      "type": "PreviewImage",
+      "pos": [
+        2480,
+        3300
+      ],
+      "size": [
+        360,
+        360
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 17
+        }
+      ],
+      "outputs": [],
+      "properties": {}
+    },
+    {
+      "id": 26,
+      "type": "LuckTextListEditor",
+      "pos": [
+        1240,
+        3300
+      ],
+      "size": [
+        520,
+        340
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_list",
+          "type": "STRING",
+          "link": 16
+        }
+      ],
+      "outputs": [
+        {
+          "name": "edited_text",
+          "type": "STRING",
+          "links": [
+            19
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "edited_texts",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LuckTextListEditor"
+      },
+      "widgets_values": []
     }
   ],
   "links": [
-    [1, 1, 0, 2, 0, "IMAGE"],
-    [2, 6, 0, 7, 0, "IMAGE"],
-    [3, 9, 0, 10, 0, "IMAGE"]
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      6,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      12,
+      0,
+      16,
+      0,
+      "STRING"
+    ],
+    [
+      5,
+      13,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      18,
+      0,
+      15,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      18,
+      0,
+      23,
+      1,
+      "IMAGE"
+    ],
+    [
+      8,
+      19,
+      0,
+      15,
+      1,
+      "IMAGE"
+    ],
+    [
+      9,
+      19,
+      0,
+      23,
+      2,
+      "IMAGE"
+    ],
+    [
+      10,
+      20,
+      0,
+      15,
+      2,
+      "IMAGE"
+    ],
+    [
+      11,
+      20,
+      0,
+      23,
+      3,
+      "IMAGE"
+    ],
+    [
+      12,
+      21,
+      0,
+      15,
+      3,
+      "IMAGE"
+    ],
+    [
+      13,
+      21,
+      0,
+      23,
+      4,
+      "IMAGE"
+    ],
+    [
+      14,
+      22,
+      0,
+      15,
+      4,
+      "IMAGE"
+    ],
+    [
+      15,
+      22,
+      0,
+      23,
+      5,
+      "IMAGE"
+    ],
+    [
+      16,
+      15,
+      0,
+      26,
+      0,
+      "STRING"
+    ],
+    [
+      17,
+      23,
+      0,
+      24,
+      0,
+      "IMAGE"
+    ],
+    [
+      18,
+      16,
+      0,
+      13,
+      0,
+      "STRING"
+    ],
+    [
+      19,
+      26,
+      0,
+      23,
+      0,
+      "STRING"
+    ]
   ],
   "groups": [],
   "config": {},

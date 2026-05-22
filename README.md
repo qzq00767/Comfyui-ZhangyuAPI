@@ -1,12 +1,56 @@
 # Comfyui-Luck gpt-2.0
 
-API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含三个独立节点：
+API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点和提示词控制节点：
 
 | 节点 | 模型 | 适合场景 | 尺寸控制 |
 |---|---|---|---|
 | `Comfyui-Luck gpt-2.0 all` | `gpt-image-2-all` | 便宜、快、中文友好、文生图/改图/多图融合 | 只能把比例写进 prompt |
 | `Comfyui-Luck gpt-image-2-vip` | `gpt-image-2-vip` | 固定 `$0.03/张`、需要 30 档尺寸或 4K | 真正传 30 档 `size` API 参数 |
 | `Comfyui-Luck gpt-image-2` | `gpt-image-2` | 需要真实 size、2K/4K、自定义尺寸、quality、mask | 真正传 `size` API 参数 |
+
+| 提示词节点 | 默认模型 | 适合场景 |
+|---|---|---|
+| `GPT-Image-2 文生图提示词控制器` | `gemini-3.5-flash` | 将文字需求整理为更适合 GPT-Image-2 的结构化生图提示词 |
+| `图生图提示词控制器` | `gemini-3.5-flash` | 读取最多 5 张参考图和可选主体图，生成带风格、构图、版式约束的出图提示词 |
+| `文本停留编辑器` | - | 工作流执行中暂停，手动编辑文本后继续 |
+
+提示词控制器使用 API易 OpenAI 兼容 `POST /v1/chat/completions`，和 Luck 出图节点一样使用 `Authorization: Bearer YOUR_API_KEY`。模型下拉包含 `gemini-3.5-flash`、`gpt-5.5`、`gpt-4o`、`gpt-4.1-mini`、`gemini-2.5-flash`、`gemini-2.5-pro`。
+
+`图生图提示词控制器` 的 `reference_image_01` 必填，`reference_image_02` 到 `reference_image_05` 可选；多张参考图会一起发送给多模态模型综合分析。`subject_image` 仍然是可选主体图，用来锁定最终画面的核心产品或人物。
+
+多图参考的推荐接法：
+
+- 只把图片接到 `图生图提示词控制器`：只做图像理解和提示词增强，后面可以按文生图使用优化后的 prompt。
+- 同一批图片同时接到后面的出图节点：才是真正的多图参考 / 多图编辑 / 多图融合。
+- 5 张图以内，优先接 `Comfyui-Luck gpt-image-2` 的 `image_01` 到 `image_05`，因为它支持真实 size、quality 和 mask。
+- 超过 5 张图时，可以改接 `Comfyui-Luck gpt-2.0 all` 或 `Comfyui-Luck gpt-image-2-vip`，它们最多支持 `image_01` 到 `image_14`。
+
+完整链路示例：
+
+```text
+5张参考图
+  ├─ 接到 图生图提示词控制器 reference_image_01~reference_image_05
+  └─ 同时接到 Comfyui-Luck gpt-image-2 image_01~image_05
+
+图生图提示词控制器 optimized_prompt
+  └─ 接到 Comfyui-Luck gpt-image-2 prompt
+```
+
+如果其中一张图是必须锁定的主体图，可以额外接到 `subject_image`，并放在后面出图节点的 `image_01`。
+
+暂停编辑后再出图的推荐接法：
+
+```text
+提示词控制器 optimized_prompt
+  └─ 接到 文本停留编辑器 text_list
+
+文本停留编辑器 edited_text
+  └─ 接到 出图节点 prompt
+```
+
+`edited_text` 是单条字符串，适合接普通出图节点的 prompt。`edited_texts` 是列表输出，保留给批量文本工作流使用。
+
+运行时请对最终 `PreviewImage` 或 `SaveImage` 发起队列执行。流程停在 `文本停留编辑器` 后，点击节点上的 `Continue` 即可让当前执行继续到后面的出图节点；不要再次点击主运行按钮，否则 ComfyUI 会重新排队并重新执行上游提示词增强。
 
 ## 安装
 
@@ -193,3 +237,7 @@ Authorization: Bearer YOUR_API_KEY
 ### 加载旧工作流报 `Value 3 smaller than min of 30`？
 
 这是旧工作流 widget 顺序不匹配导致的：`retry_times=3` 被错读成了 `timeout_seconds=3`。请使用当前 `example_workflow.json`，或重新添加节点。
+
+### 接入 `文本停留编辑器` 后，`gpt-image-2` 报 `Value not in list`？
+
+这是把 `prompt` 转成输入口后，旧 workflow 少了一个 prompt 占位，导致后面的控件整体前移：例如 `mode` 被读成 `gpt-image-2`、`api_base` 被读成 `2K`、`image_size` 被读成 `16:9`。当前节点会在校验阶段放行，并在运行时自动把这些错位参数恢复；新 `example_workflow.json` 也已经补好占位。若界面上仍显示错位，重载当前工作流或重新添加 `Comfyui-Luck gpt-image-2` 节点即可。

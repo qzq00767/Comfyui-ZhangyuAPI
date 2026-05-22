@@ -307,6 +307,12 @@ def safe_int(value, default, min_value=None, max_value=None):
     return number
 
 
+def normalize_prompt_text(value):
+    if isinstance(value, list):
+        return "\n".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
 def emit_runtime_status(
     node_id,
     status,
@@ -391,7 +397,7 @@ class ComfyuiLuckGPT20Node:
         return ""
 
     def _compose_prompt(self, prompt, aspect_ratio):
-        clean_prompt = (prompt or "").strip()
+        clean_prompt = normalize_prompt_text(prompt)
         prefix = self._prompt_prefix(aspect_ratio)
 
         if not clean_prompt and not prefix:
@@ -787,7 +793,7 @@ class ComfyuiLuckGPTImage2VipNode(ComfyuiLuckGPT20Node):
             emit_runtime_status(unique_id, "error", "API Key 为空", 0.0, 0, retry_times, timeout_seconds)
             raise ValueError("API Key 不能为空")
 
-        clean_prompt = (prompt or "").strip()
+        clean_prompt = normalize_prompt_text(prompt)
         if not clean_prompt:
             raise ValueError("prompt 不能为空")
 
@@ -1031,6 +1037,10 @@ class ComfyuiLuckGPTImage2Node:
             },
         }
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return True
+
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image", "response")
     FUNCTION = "generate"
@@ -1121,6 +1131,33 @@ class ComfyuiLuckGPTImage2Node:
                 kwargs.get("custom_size (自定义尺寸)", ""),
             ),
         )
+        if (
+            mode not in ("AUTO", "text2img", "img2img")
+            and isinstance(model, str)
+            and model.startswith("http")
+        ):
+            # Old workflows can shift widget values after converting prompt to
+            # an input. Recover the intended gpt-image-2 settings instead of
+            # sending model=https://... or size=16:9 to the API.
+            shifted_api_base = model
+            shifted_image_size = api_base
+            shifted_aspect_ratio = image_size
+            shifted_custom_size = aspect_ratio
+            shifted_quality = custom_size
+            shifted_output_format = kwargs.get("quality (画质)", "png")
+            shifted_output_compression = kwargs.get("output_format (输出格式)", 85)
+
+            mode = "AUTO"
+            model = "gpt-image-2"
+            api_base = shifted_api_base.rstrip("/")
+            image_size = shifted_image_size
+            aspect_ratio = shifted_aspect_ratio
+            custom_size = shifted_custom_size
+            kwargs["quality (画质)"] = shifted_quality
+            kwargs["output_format (输出格式)"] = shifted_output_format
+            kwargs["output_compression (压缩率)"] = shifted_output_compression
+            kwargs["timeout_seconds (超时秒数)"] = 360
+
         quality = safe_choice(kwargs.get("quality (画质)", "auto"), ["auto", "low", "medium", "high"], "auto")
         output_format = safe_choice(kwargs.get("output_format (输出格式)", "png"), ["png", "jpeg", "webp"], "png")
         output_compression = safe_int(kwargs.get("output_compression (压缩率)", 85), 85, 0, 100)
@@ -1134,7 +1171,7 @@ class ComfyuiLuckGPTImage2Node:
             emit_runtime_status(unique_id, "error", "API Key 为空", 0.0, 0, retry_times, timeout_seconds)
             raise ValueError("API Key 不能为空")
 
-        clean_prompt = (prompt or "").strip()
+        clean_prompt = normalize_prompt_text(prompt)
         if not clean_prompt:
             raise ValueError("prompt 不能为空")
 
