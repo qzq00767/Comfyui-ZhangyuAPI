@@ -576,7 +576,7 @@ class ZhangyuAPITextListEditor:
         }
 
         server.PromptServer.instance.send_sync(
-            "luck_text_list_edit_session",
+            "zhangyuapi_text_list_edit_session",
             {
                 "session_id": session_id,
                 "node_id": unique_id,
@@ -616,7 +616,7 @@ class ZhangyuAPITextListEditor:
 
 
 def _add_text_editor_routes(routes):
-    @routes.post("/luck_text_list_edit/confirm")
+    @routes.post("/zhangyuapi_text_list_edit/confirm")
     async def confirm(request):
         try:
             data = await request.json()
@@ -636,7 +636,7 @@ def _add_text_editor_routes(routes):
             print(f"ZhangyuAPITextListEditor: confirm error: {exc}")
             return web.json_response({"status": "error", "message": str(exc)}, status=500)
 
-    @routes.post("/luck_text_list_edit/cancel")
+    @routes.post("/zhangyuapi_text_list_edit/cancel")
     async def cancel(request):
         try:
             data = await request.json()

@@ -1,7 +1,7 @@
 from .gpt_2_0_node import NODE_CLASS_MAPPINGS as GPT_NODE_CLASS_MAPPINGS
 from .gpt_2_0_node import NODE_DISPLAY_NAME_MAPPINGS as GPT_NODE_DISPLAY_NAME_MAPPINGS
-from .luck_prompt_control_nodes import NODE_CLASS_MAPPINGS as PROMPT_NODE_CLASS_MAPPINGS
-from .luck_prompt_control_nodes import NODE_DISPLAY_NAME_MAPPINGS as PROMPT_NODE_DISPLAY_NAME_MAPPINGS
+from .zhangyuapi_prompt_control_nodes import NODE_CLASS_MAPPINGS as PROMPT_NODE_CLASS_MAPPINGS
+from .zhangyuapi_prompt_control_nodes import NODE_DISPLAY_NAME_MAPPINGS as PROMPT_NODE_DISPLAY_NAME_MAPPINGS
 
 
 NODE_CLASS_MAPPINGS = {

@@ -67,7 +67,7 @@ app.registerExtension({
     name: "Comfyuizhangyuapi.TextListEditor",
 
     async setup() {
-        api.addEventListener("luck_text_list_edit_session", (event) => {
+        api.addEventListener("zhangyuapi_text_list_edit_session", (event) => {
             const { session_id, node_id, texts } = event.detail;
             const node = app.graph._nodes.find(n => n.id == node_id);
             if (!node || !texts || texts.length === 0) return;
@@ -124,7 +124,7 @@ app.registerExtension({
                 }
 
                 try {
-                    const response = await sendRequest('/luck_text_list_edit/confirm', {
+                    const response = await sendRequest('/zhangyuapi_text_list_edit/confirm', {
                         session_id: this.session_id,
                         edited_texts: editedTexts
                     });
@@ -145,7 +145,7 @@ app.registerExtension({
             const cancelButton = this.addWidget("button", "Cancel", null, async () => {
                 if (this.session_id) {
                     try {
-                        await sendRequest('/luck_text_list_edit/cancel', {
+                        await sendRequest('/zhangyuapi_text_list_edit/cancel', {
                             session_id: this.session_id
                         });
                     } catch (error) {

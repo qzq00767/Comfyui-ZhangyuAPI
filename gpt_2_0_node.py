@@ -1460,8 +1460,8 @@ try:
     if _comfy_server is not None and _comfy_server.PromptServer.instance is not None:
         _routes = _comfy_server.PromptServer.instance.routes
 
-        @_routes.post("/luck_fetch_models")
-        async def _luck_fetch_models_route(request):
+        @_routes.post("/zhangyuapi_fetch_models")
+        async def _zhangyuapi_fetch_models_route(request):
             try:
                 data = await request.json()
                 api_base = data.get("api_base", "")

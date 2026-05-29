@@ -12,7 +12,7 @@ const TARGET_NODE_TYPES = new Set([
     "ComfyuiZhangyuAPIImage2Node",
 ]);
 
-const MODEL_FETCH_ROUTE = "/luck_fetch_models";
+const MODEL_FETCH_ROUTE = "/zhangyuapi_fetch_models";
 
 
 function findModelWidget(node) {
