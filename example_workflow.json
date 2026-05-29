@@ -4,7 +4,7 @@
   "nodes": [
     {
       "id": 1,
-      "type": "ComfyuiLuckGPT20Node",
+      "type": "ComfyuiZhangyuAPINode",
       "pos": [
         420,
         180
@@ -40,14 +40,14 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ComfyuiLuckGPT20Node"
+        "Node name for S&R": "ComfyuiZhangyuAPINode"
       },
       "widgets_values": [
         "",
         "一张中文电影海报，标题文字写“未来之城”，霓虹灯街道，雨夜反光，人物站在画面中央，文字清晰可读，写实电影质感",
         "AUTO",
         "gpt-image-2-all",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "chat_completions (推荐)",
         "16:9",
         "url",
@@ -97,7 +97,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "【模型怎么选】\n\n1. Comfyui-Luck gpt-2.0 all\n   - gpt-image-2-all：$0.03/张，约 30-60 秒\n   - 不传真实 size，只把画幅写进 prompt\n\n2. Comfyui-Luck gpt-image-2-vip\n   - gpt-image-2-vip：$0.03/张，约 90-150 秒\n   - 用 image_size + aspect_ratio 传真实 size\n\n3. Comfyui-Luck gpt-image-2\n   - 官转模型，支持 quality / custom / mask\n   - timeout 建议 360 秒\n\n4. 提示词控制器\n   - 默认 gemini-3.5-flash\n   - 可选 gpt-5.5 / gpt-4o / gpt-4.1-mini\n   - API Key 和接口域名与 Luck 出图节点一致\n\n分享工作流前请清空 API Key。"
+        "【模型怎么选】\n\n1. Comfyui-ZhangyuAPI all\n   - gpt-image-2-all：$0.03/张，约 30-60 秒\n   - 不传真实 size，只把画幅写进 prompt\n\n2. Comfyui-ZhangyuAPI gpt-image-2-vip\n   - gpt-image-2-vip：$0.03/张，约 90-150 秒\n   - 用 image_size + aspect_ratio 传真实 size\n\n3. Comfyui-ZhangyuAPI gpt-image-2\n   - 官转模型，支持 quality / custom / mask\n   - timeout 建议 360 秒\n\n4. 提示词控制器\n   - 默认 gemini-3.5-flash\n   - 可选 gpt-5.5 / gpt-4o / gpt-4.1-mini\n   - API Key 和接口域名与 Luck 出图节点一致\n\n分享工作流前请清空 API Key。"
       ]
     },
     {
@@ -140,7 +140,7 @@
     },
     {
       "id": 6,
-      "type": "ComfyuiLuckGPTImage2Node",
+      "type": "ComfyuiZhangyuAPIImage2Node",
       "pos": [
         420,
         820
@@ -170,14 +170,14 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ComfyuiLuckGPTImage2Node"
+        "Node name for S&R": "ComfyuiZhangyuAPIImage2Node"
       },
       "widgets_values": [
         "",
         "赛博朋克城市雨夜，霓虹招牌特写，电影画幅，文字清晰",
         "AUTO",
         "gpt-image-2",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "2K",
         "16:9",
         "1600x1200",
@@ -216,7 +216,7 @@
     },
     {
       "id": 9,
-      "type": "ComfyuiLuckGPTImage2VipNode",
+      "type": "ComfyuiZhangyuAPIImage2VipNode",
       "pos": [
         420,
         1500
@@ -252,14 +252,14 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ComfyuiLuckGPTImage2VipNode"
+        "Node name for S&R": "ComfyuiZhangyuAPIImage2VipNode"
       },
       "widgets_values": [
         "",
         "白色陶瓷马克杯放在灰色桌面上，柔和自然光，简洁产品摄影",
         "AUTO",
         "gpt-image-2-vip",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "chat_completions (推荐)",
         "2K Recommended",
         "16:9",
@@ -334,7 +334,7 @@
     },
     {
       "id": 12,
-      "type": "LuckGPTImage2PromptOptimizer",
+      "type": "ZhangyuAPIImage2PromptOptimizer",
       "pos": [
         420,
         2180
@@ -364,11 +364,11 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LuckGPTImage2PromptOptimizer"
+        "Node name for S&R": "ZhangyuAPIImage2PromptOptimizer"
       },
       "widgets_values": [
         "",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "为一款高端白色陶瓷马克杯生成电商主图：干净背景，柔和自然光，突出质感，画面可加入简短中文标题“温润如玉”。",
         "电商主图",
         "保留原文",
@@ -383,7 +383,7 @@
     },
     {
       "id": 13,
-      "type": "ComfyuiLuckGPTImage2Node",
+      "type": "ComfyuiZhangyuAPIImage2Node",
       "pos": [
         1660,
         2180
@@ -419,14 +419,14 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ComfyuiLuckGPTImage2Node"
+        "Node name for S&R": "ComfyuiZhangyuAPIImage2Node"
       },
       "widgets_values": [
         "",
         "",
         "AUTO",
         "gpt-image-2",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "2K",
         "16:9",
         "1600x1200",
@@ -465,7 +465,7 @@
     },
     {
       "id": 15,
-      "type": "LuckReferenceImagePromptOptimizer",
+      "type": "ZhangyuAPIReferenceImagePromptOptimizer",
       "pos": [
         640,
         3300
@@ -526,11 +526,11 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LuckReferenceImagePromptOptimizer"
+        "Node name for S&R": "ZhangyuAPIReferenceImagePromptOptimizer"
       },
       "widgets_values": [
         "",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "综合参考 5 张图片的构图、光影、色彩、文字版式和共同视觉规律，并生成一条适合后面 gpt-image-2 多图生成的中文提示词。",
         "自动判断",
         "16:9",
@@ -542,7 +542,7 @@
     },
     {
       "id": 16,
-      "type": "LuckTextListEditor",
+      "type": "ZhangyuAPITextListEditor",
       "pos": [
         1040,
         2180
@@ -578,7 +578,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LuckTextListEditor"
+        "Node name for S&R": "ZhangyuAPITextListEditor"
       },
       "widgets_values": []
     },
@@ -617,7 +617,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "【完整 5 图参考 -> 暂停编辑 -> 多图出图链路】\n\n下面 5 个 LoadImage 节点每张图都一拖二：\n1. 接到 图生图提示词控制器 reference_image_01~05，用来综合分析并生成 optimized_prompt。\n2. 同时接到 Comfyui-Luck gpt-image-2 的 image_01~05，用来让最终出图真实参考这 5 张图。\n\n正确执行链路：\n图生图提示词控制器 optimized_prompt -> 文本停留编辑器 text_list -> edited_text -> 后面出图节点 prompt。\n\n点击 Continue 只会放行当前等待中的流程，让后面的 gpt-image-2 继续生图；不要再次点击主运行按钮，否则会重新跑上游提示词增强。"
+        "【完整 5 图参考 -> 暂停编辑 -> 多图出图链路】\n\n下面 5 个 LoadImage 节点每张图都一拖二：\n1. 接到 图生图提示词控制器 reference_image_01~05，用来综合分析并生成 optimized_prompt。\n2. 同时接到 Comfyui-ZhangyuAPI -image-2 的 image_01~05，用来让最终出图真实参考这 5 张图。\n\n正确执行链路：\n图生图提示词控制器 optimized_prompt -> 文本停留编辑器 text_list -> edited_text -> 后面出图节点 prompt。\n\n点击 Continue 只会放行当前等待中的流程，让后面的 gpt-image-2 继续生图；不要再次点击主运行按钮，否则会重新跑上游提示词增强。"
       ]
     },
     {
@@ -822,7 +822,7 @@
     },
     {
       "id": 23,
-      "type": "ComfyuiLuckGPTImage2Node",
+      "type": "ComfyuiZhangyuAPIImage2Node",
       "pos": [
         1860,
         3300
@@ -883,14 +883,14 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ComfyuiLuckGPTImage2Node"
+        "Node name for S&R": "ComfyuiZhangyuAPIImage2Node"
       },
       "widgets_values": [
         "",
         "",
         "AUTO",
         "gpt-image-2",
-        "http://api.apiyi.com:16888",
+        "https://zhangyuapi.com",
         "2K",
         "16:9",
         "1600x1200",
@@ -929,7 +929,7 @@
     },
     {
       "id": 26,
-      "type": "LuckTextListEditor",
+      "type": "ZhangyuAPITextListEditor",
       "pos": [
         1240,
         3300
@@ -965,7 +965,7 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LuckTextListEditor"
+        "Node name for S&R": "ZhangyuAPITextListEditor"
       },
       "widgets_values": []
     }

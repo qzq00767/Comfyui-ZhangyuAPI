@@ -64,7 +64,7 @@ const sendRequest = async (endpoint, data) => {
 };
 
 app.registerExtension({
-    name: "ComfyuiLuck.TextListEditor",
+    name: "Comfyuizhangyuapi.TextListEditor",
 
     async setup() {
         api.addEventListener("luck_text_list_edit_session", (event) => {
@@ -88,7 +88,7 @@ app.registerExtension({
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name !== "LuckTextListEditor") return;
+        if (nodeData.name !== "ZhangyuAPITextListEditor") return;
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function() {
@@ -164,4 +164,4 @@ app.registerExtension({
     }
 });
 
-console.log("Comfyui-Luck Text List Editor extension loaded");
+console.log("Comfyui-zhangyuapi Text List Editor extension loaded");

@@ -17,7 +17,7 @@ import uuid
 
 import requests
 
-from .gpt_2_0_node import API_BASE_URLS, DEFAULT_API_BASE_URL, apiyi_post, tensor_to_data_url
+from .gpt_2_0_node import API_BASE_URLS, DEFAULT_API_BASE_URL, normalize_api_base, ZHANGYUAPI_post, tensor_to_data_url
 from .gpt_2_0_node import emit_runtime_status
 
 try:
@@ -85,11 +85,7 @@ _SQUARE = {"1:1"}
 
 
 def _chat_url(api_base):
-    base = (api_base or DEFAULT_API_BASE_URL).strip().rstrip("/")
-    if base.endswith("/v1/chat/completions"):
-        return base
-    if base.endswith("/v1"):
-        return f"{base}/chat/completions"
+    base = normalize_api_base(api_base)
     return f"{base}/v1/chat/completions"
 
 
@@ -131,7 +127,7 @@ def _call_apiyi_chat(api_base, api_key, model, messages, timeout_seconds=600):
         "messages": messages,
         "stream": False,
     }
-    response = apiyi_post(
+    response = ZHANGYUAPI_post(
         _chat_url(api_base),
         timeout_seconds,
         headers=_api_headers(api_key),
@@ -290,7 +286,7 @@ def _normalize_schema(schema, aspect_ratio, exact_text, text_policy, optimize_st
     return schema
 
 
-class LuckReferenceImagePromptOptimizer:
+class ZhangyuAPIReferenceImagePromptOptimizer:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -405,7 +401,7 @@ class LuckReferenceImagePromptOptimizer:
             raise
 
 
-class LuckGPTImage2PromptOptimizer:
+class ZhangyuAPIImage2PromptOptimizer:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -518,7 +514,6 @@ class LuckGPTImage2PromptOptimizer:
                 f"resolved_layout_type={schema.get('image_type', '')}\n"
                 f"resolved_text_policy={schema.get('text_policy', '')}\n"
                 f"schema_result={json.dumps(schema, ensure_ascii=False)}\n"
-                f"renderer_input={json.dumps(schema, ensure_ascii=False)}\n"
                 f"final_prompt={optimized}"
             )
             elapsed = time.time() - start_ts
@@ -530,9 +525,21 @@ class LuckGPTImage2PromptOptimizer:
 
 
 _pending_text_lists = {}
+_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
-class LuckTextListEditor:
+def _cleanup_orphaned_sessions():
+    """Remove stale sessions that were never confirmed or cancelled."""
+    now = time.time()
+    stale = [
+        sid for sid, session in _pending_text_lists.items()
+        if now - session.get("_created_at", 0) > _SESSION_TIMEOUT_SECONDS
+    ]
+    for sid in stale:
+        del _pending_text_lists[sid]
+
+
+class ZhangyuAPITextListEditor:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -565,6 +572,7 @@ class LuckTextListEditor:
             "edited_texts": cleaned_texts.copy(),
             "confirmed": False,
             "cancelled": False,
+            "_created_at": time.time(),
         }
 
         server.PromptServer.instance.send_sync(
@@ -576,7 +584,9 @@ class LuckTextListEditor:
             },
         )
 
-        timeout = 3600
+        # Clean up orphaned sessions before waiting
+        _cleanup_orphaned_sessions()
+
         start_time = time.time()
         while True:
             time.sleep(0.1)
@@ -591,7 +601,8 @@ class LuckTextListEditor:
                 del _pending_text_lists[session_id]
                 interrupt_processing()
                 return ("", [])
-            if time.time() - start_time > timeout:
+            if time.time() - start_time > _SESSION_TIMEOUT_SECONDS:
+                print(f"ZhangyuAPITextListEditor: session {session_id} timed out after {_SESSION_TIMEOUT_SECONDS}s")
                 del _pending_text_lists[session_id]
                 interrupt_processing()
                 return ("", [])
@@ -622,7 +633,7 @@ def _add_text_editor_routes(routes):
             _pending_text_lists[session_id]["confirmed"] = True
             return web.json_response({"status": "success"})
         except Exception as exc:
-            print(f"LuckTextListEditor: confirm error: {exc}")
+            print(f"ZhangyuAPITextListEditor: confirm error: {exc}")
             return web.json_response({"status": "error", "message": str(exc)}, status=500)
 
     @routes.post("/luck_text_list_edit/cancel")
@@ -637,7 +648,7 @@ def _add_text_editor_routes(routes):
             _pending_text_lists[session_id]["cancelled"] = True
             return web.json_response({"status": "success"})
         except Exception as exc:
-            print(f"LuckTextListEditor: cancel error: {exc}")
+            print(f"ZhangyuAPITextListEditor: cancel error: {exc}")
             return web.json_response({"status": "error", "message": str(exc)}, status=500)
 
 
@@ -645,17 +656,17 @@ try:
     if server is not None and web is not None and server.PromptServer.instance is not None:
         _add_text_editor_routes(server.PromptServer.instance.routes)
 except Exception as exc:
-    print(f"Warning: Could not register LuckTextListEditor routes: {exc}")
+    print(f"Warning: Could not register ZhangyuAPITextListEditor routes: {exc}")
 
 
 NODE_CLASS_MAPPINGS = {
-    "LuckReferenceImagePromptOptimizer": LuckReferenceImagePromptOptimizer,
-    "LuckGPTImage2PromptOptimizer": LuckGPTImage2PromptOptimizer,
-    "LuckTextListEditor": LuckTextListEditor,
+    "ZhangyuAPIReferenceImagePromptOptimizer": ZhangyuAPIReferenceImagePromptOptimizer,
+    "ZhangyuAPIImage2PromptOptimizer": ZhangyuAPIImage2PromptOptimizer,
+    "ZhangyuAPITextListEditor": ZhangyuAPITextListEditor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LuckReferenceImagePromptOptimizer": "图生图提示词控制器",
-    "LuckGPTImage2PromptOptimizer": "GPT-Image-2 文生图提示词控制器",
-    "LuckTextListEditor": "文本停留编辑器",
+    "ZhangyuAPIReferenceImagePromptOptimizer": "图生图提示词控制器",
+    "ZhangyuAPIImage2PromptOptimizer": "GPT-Image-2 文生图提示词控制器",
+    "ZhangyuAPITextListEditor": "文本停留编辑器",
 }

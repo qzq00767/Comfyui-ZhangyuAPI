@@ -1,12 +1,12 @@
-# Comfyui-Luck gpt-2.0
+# ComfyuiZhangyuAPI
 
-API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点和提示词控制节点：
+ComfyuiZhangyuAPI GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点和提示词控制节点：
 
 | 节点 | 模型 | 适合场景 | 尺寸控制 |
 |---|---|---|---|
-| `Comfyui-Luck gpt-2.0 all` | `gpt-image-2-all` | 便宜、快、中文友好、文生图/改图/多图融合 | 只能把比例写进 prompt |
-| `Comfyui-Luck gpt-image-2-vip` | `gpt-image-2-vip` | 固定 `$0.03/张`、需要 30 档尺寸或 4K | 真正传 30 档 `size` API 参数 |
-| `Comfyui-Luck gpt-image-2` | `gpt-image-2` | 需要真实 size、2K/4K、自定义尺寸、quality、mask | 真正传 `size` API 参数 |
+| `ComfyuiZhangyuAPI all` | `gpt-image-2-all` | 便宜、快、中文友好、文生图/改图/多图融合 | 只能把比例写进 prompt |
+| `ComfyuiZhangyuAPI gpt-image-2-vip` | `gpt-image-2-vip` | 固定 `$0.03/张`、需要 30 档尺寸或 4K | 真正传 30 档 `size` API 参数 |
+| `ComfyuiZhangyuAPI gpt-image-2` | `gpt-image-2` | 需要真实 size、2K/4K、自定义尺寸、quality、mask | 真正传 `size` API 参数 |
 
 | 提示词节点 | 默认模型 | 适合场景 |
 |---|---|---|
@@ -14,7 +14,7 @@ API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点
 | `图生图提示词控制器` | `gemini-3.5-flash` | 读取最多 5 张参考图和可选主体图，生成带风格、构图、版式约束的出图提示词 |
 | `文本停留编辑器` | - | 工作流执行中暂停，手动编辑文本后继续 |
 
-提示词控制器使用 API易 OpenAI 兼容 `POST /v1/chat/completions`，和 Luck 出图节点一样使用 `Authorization: Bearer YOUR_API_KEY`。模型下拉包含 `gemini-3.5-flash`、`gpt-5.5`、`gpt-4o`、`gpt-4.1-mini`、`gemini-2.5-flash`、`gemini-2.5-pro`。
+提示词控制器使用 ComfyuiZhangyuAPI OpenAI 兼容 `POST /v1/chat/completions`，和 Luck 出图节点一样使用 `Authorization: Bearer YOUR_API_KEY`。模型下拉包含 `gemini-3.5-flash`、`gpt-5.5`、`gpt-4o`、`gpt-4.1-mini`、`gemini-2.5-flash`、`gemini-2.5-pro`。
 
 `图生图提示词控制器` 的 `reference_image_01` 必填，`reference_image_02` 到 `reference_image_05` 可选；多张参考图会一起发送给多模态模型综合分析。`subject_image` 仍然是可选主体图，用来锁定最终画面的核心产品或人物。
 
@@ -22,18 +22,18 @@ API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点
 
 - 只把图片接到 `图生图提示词控制器`：只做图像理解和提示词增强，后面可以按文生图使用优化后的 prompt。
 - 同一批图片同时接到后面的出图节点：才是真正的多图参考 / 多图编辑 / 多图融合。
-- 5 张图以内，优先接 `Comfyui-Luck gpt-image-2` 的 `image_01` 到 `image_05`，因为它支持真实 size、quality 和 mask。
-- 超过 5 张图时，可以改接 `Comfyui-Luck gpt-2.0 all` 或 `Comfyui-Luck gpt-image-2-vip`，它们最多支持 `image_01` 到 `image_14`。
+- 5 张图以内，优先接 `ComfyuiZhangyuAPI gpt-image-2` 的 `image_01` 到 `image_05`，因为它支持真实 size、quality 和 mask。
+- 超过 5 张图时，可以改接 `ComfyuiZhangyuAPI all` 或 `ComfyuiZhangyuAPI gpt-image-2-vip`，它们最多支持 `image_01` 到 `image_14`。
 
 完整链路示例：
 
 ```text
 5张参考图
   ├─ 接到 图生图提示词控制器 reference_image_01~reference_image_05
-  └─ 同时接到 Comfyui-Luck gpt-image-2 image_01~image_05
+  └─ 同时接到 ComfyuiZhangyuAPI gpt-image-2 image_01~image_05
 
 图生图提示词控制器 optimized_prompt
-  └─ 接到 Comfyui-Luck gpt-image-2 prompt
+  └─ 接到 ComfyuiZhangyuAPI gpt-image-2 prompt
 ```
 
 如果其中一张图是必须锁定的主体图，可以额外接到 `subject_image`，并放在后面出图节点的 `image_01`。
@@ -61,9 +61,9 @@ API易 GPT 图像模型的 ComfyUI 自定义节点包，当前包含出图节点
 python3 -m pip install -r requirements.txt
 ```
 
-3. 重启 ComfyUI，搜索 `Comfyui-Luck`。
+3. 重启 ComfyUI，搜索 `ComfyuiZhangyuAPI`。
 
-## 节点 1：Comfyui-Luck gpt-2.0 all
+## 节点 1：ComfyuiZhangyuAPI all
 
 使用 `gpt-image-2-all`。
 
@@ -72,7 +72,7 @@ python3 -m pip install -r requirements.txt
 - 统一按次计费，约 `$0.03/张`。
 - ChatGPT 网页线，约 30-60 秒，出图较快。
 - 支持文生图、单图改图、多图融合、自然语言改图。
-- 默认走 API易主推的 `POST /v1/chat/completions`，提示词遵循更好。
+- 默认走 ComfyuiZhangyuAPI主推的 `POST /v1/chat/completions`，提示词遵循更好。
 - 可切到 `images_api (兼容)`，走 `/v1/images/generations` 或 `/v1/images/edits`。
 - 不支持真实 `size`、`quality`、`n`、`aspect_ratio` API 字段，节点不会发送这些字段。
 
@@ -95,7 +95,7 @@ python3 -m pip install -r requirements.txt
 - 推荐超时：`300` 秒。
 - `408`、`429`、`5xx` 会按 `retry_times` 自动重试。
 
-## 节点 2：Comfyui-Luck gpt-image-2-vip
+## 节点 2：ComfyuiZhangyuAPI gpt-image-2-vip
 
 使用 `gpt-image-2-vip`。
 
@@ -107,7 +107,7 @@ python3 -m pip install -r requirements.txt
 - 支持 `chat_completions (推荐)` 与 `images_api (兼容)` 两种端点。
 - 真正发送 `size` 字段；不支持 `quality` 和 `n`，节点不会发送这些字段。
 - `b64_json` 已带 `data:image/png;base64,` 前缀，节点会自动兼容解码。
-- VIP 的比例严格跟随 API易文档 30 档真实尺寸，只提供 `1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`21:9`。如果要 `9:21`、`3:1`、`1:3` 等更多比例，请用 `gpt-image-2-all` 写进 prompt，或用官转 `gpt-image-2` 传真实合法 size。
+- VIP 的比例严格跟随 ComfyuiZhangyuAPI文档 30 档真实尺寸，只提供 `1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`21:9`。如果要 `9:21`、`3:1`、`1:3` 等更多比例，请用 `gpt-image-2-all` 写进 prompt，或用官转 `gpt-image-2` 传真实合法 size。
 
 尺寸换算：
 
@@ -127,11 +127,11 @@ python3 -m pip install -r requirements.txt
 说明：
 
 - 节点会把上表解析成真实 `size` 字段发送给 API。
-- `gpt-image-2-vip` 不接受表外尺寸；需要任意合法自定义尺寸时，请使用 `Comfyui-Luck gpt-image-2`。
+- `gpt-image-2-vip` 不接受表外尺寸；需要任意合法自定义尺寸时，请使用 `ComfyuiZhangyuAPI gpt-image-2`。
 - 推荐超时：`300` 秒。
 - `408`、`429`、`5xx` 会按 `retry_times` 自动重试。
 
-## 节点 3：Comfyui-Luck gpt-image-2
+## 节点 3：ComfyuiZhangyuAPI gpt-image-2
 
 使用官方契约的 `gpt-image-2`。
 
@@ -192,7 +192,7 @@ python3 -m pip install -r requirements.txt
 - 节点不会发送 `input_fidelity`。
 - 节点主面板不再显示 `background` / `moderation`，默认不传，使用 API 默认值。
 - 推荐超时：`360` 秒。
-- `408`、`429`、`5xx` 会按 `retry_times` 自动重试。`408 Timeout` 通常是 APIYi 上游生成任务超时，不是节点参数填错。
+- `408`、`429`、`5xx` 会按 `retry_times` 自动重试。`408 Timeout` 通常是 ZhangyuAPI 上游生成任务超时，不是节点参数填错。
 
 `background` / `moderation` 原本的作用：
 
@@ -203,11 +203,10 @@ python3 -m pip install -r requirements.txt
 
 可选域名：
 
-- 主域名：`http://api.apiyi.com:16888`
-- 备用：`http://b.apiyi.com:16888`
-- 兼容旧域名：`https://api.apiyi.com`
-- 备用：`https://vip.apiyi.com`
-- 备用：`https://b.apiyi.com`
+- 主域名：`https://zhangyuapi.com`
+- API易：`https://api.apiyi.com`
+- 贞贞：`https://ai.t8star.org`
+- GPT：`https://api.openai.com`
 
 节点底层使用自定义 `requests.Session`，按 HTTP/1.1 行为请求接口，并把超时拆成连接超时 `30` 秒 + 节点面板里的读取超时秒数，减少长耗时生成时的中断。
 
@@ -238,11 +237,11 @@ Authorization: Bearer YOUR_API_KEY
 
 ### gpt-image-2-vip 怎么用？
 
-添加 `Comfyui-Luck gpt-image-2-vip` 节点，再选 `image_size` 和 `aspect_ratio`。例如 `2K Recommended + 16:9` 会发送 `size=2048x1152`；`4K Detail + 16:9` 会发送 `size=3840x2160`。
+添加 `ComfyuiZhangyuAPI gpt-image-2-vip` 节点，再选 `image_size` 和 `aspect_ratio`。例如 `2K Recommended + 16:9` 会发送 `size=2048x1152`；`4K Detail + 16:9` 会发送 `size=3840x2160`。
 
 ### 哪个节点能真实控制分辨率？
 
-如果只需要 30 档常见尺寸并想固定 `$0.03/张`，用 `Comfyui-Luck gpt-image-2-vip`。如果需要任意合法自定义尺寸、`quality` 或 mask 局部重绘，用 `Comfyui-Luck gpt-image-2`。例如 `image_size=2K` + `aspect_ratio=4:3` 会真正向 API 传 `size=2048x1536`。
+如果只需要 30 档常见尺寸并想固定 `$0.03/张`，用 `ComfyuiZhangyuAPI gpt-image-2-vip`。如果需要任意合法自定义尺寸、`quality` 或 mask 局部重绘，用 `ComfyuiZhangyuAPI gpt-image-2`。例如 `image_size=2K` + `aspect_ratio=4:3` 会真正向 API 传 `size=2048x1536`。
 
 ### 加载旧工作流报 `Value 3 smaller than min of 30`？
 
@@ -250,4 +249,4 @@ Authorization: Bearer YOUR_API_KEY
 
 ### 接入 `文本停留编辑器` 后，`gpt-image-2` 报 `Value not in list`？
 
-这是把 `prompt` 转成输入口后，旧 workflow 少了一个 prompt 占位，导致后面的控件整体前移：例如 `mode` 被读成 `gpt-image-2`、`api_base` 被读成 `2K`、`image_size` 被读成 `16:9`。当前节点会在校验阶段放行，并在运行时自动把这些错位参数恢复；新 `example_workflow.json` 也已经补好占位。若界面上仍显示错位，重载当前工作流或重新添加 `Comfyui-Luck gpt-image-2` 节点即可。
+这是把 `prompt` 转成输入口后，旧 workflow 少了一个 prompt 占位，导致后面的控件整体前移：例如 `mode` 被读成 `gpt-image-2`、`api_base` 被读成 `2K`、`image_size` 被读成 `16:9`。当前节点会在校验阶段放行，并在运行时自动把这些错位参数恢复；新 `example_workflow.json` 也已经补好占位。若界面上仍显示错位，重载当前工作流或重新添加 `ComfyuiZhangyuAPI gpt-image-2` 节点即可。

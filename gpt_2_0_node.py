@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Comfyui-Luck gpt-2.0 nodes for APIYi.
+Comfyui-ZhangyuAPI nodes for zhangyuapi.com.
 
 The gpt-image-2-all API does not accept size, n, quality, or aspect_ratio.
 Composition controls are converted into a prompt prefix. The gpt-image-2-vip
@@ -21,22 +21,18 @@ import requests
 import torch
 
 
-DEFAULT_API_BASE_URL = "http://api.apiyi.com:16888"
+DEFAULT_API_BASE_URL = "https://zhangyuapi.com/v1"
 API_BASE_URLS = [
     DEFAULT_API_BASE_URL,
-    "http://b.apiyi.com:16888",
-    "https://api.apiyi.com",
-    "https://b.apiyi.com",
-    "https://vip.apiyi.com",
 ]
 API_CONNECT_TIMEOUT_SECONDS = 30
-APIYI_HTTP_SESSION = requests.Session()
-APIYI_HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
-APIYI_HTTP_SESSION.mount("http://", APIYI_HTTP_ADAPTER)
-APIYI_HTTP_SESSION.mount("https://", APIYI_HTTP_ADAPTER)
+ZHANGYUAPI_HTTP_SESSION = requests.Session()
+ZHANGYUAPI_HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+ZHANGYUAPI_HTTP_SESSION.mount("http://", ZHANGYUAPI_HTTP_ADAPTER)
+ZHANGYUAPI_HTTP_SESSION.mount("https://", ZHANGYUAPI_HTTP_ADAPTER)
 
 
-def apiyi_timeout(timeout_seconds):
+def ZHANGYUAPI_timeout(timeout_seconds):
     try:
         read_timeout = int(timeout_seconds)
     except (TypeError, ValueError):
@@ -44,12 +40,33 @@ def apiyi_timeout(timeout_seconds):
     return (API_CONNECT_TIMEOUT_SECONDS, max(1, read_timeout))
 
 
-def apiyi_get(url, timeout_seconds, **kwargs):
-    return APIYI_HTTP_SESSION.get(url, timeout=apiyi_timeout(timeout_seconds), **kwargs)
+def ZHANGYUAPI_get(url, timeout_seconds, **kwargs):
+    return ZHANGYUAPI_HTTP_SESSION.get(url, timeout=ZHANGYUAPI_timeout(timeout_seconds), **kwargs)
 
 
-def apiyi_post(url, timeout_seconds, **kwargs):
-    return APIYI_HTTP_SESSION.post(url, timeout=apiyi_timeout(timeout_seconds), **kwargs)
+def ZHANGYUAPI_post(url, timeout_seconds, **kwargs):
+    return ZHANGYUAPI_HTTP_SESSION.post(url, timeout=ZHANGYUAPI_timeout(timeout_seconds), **kwargs)
+
+
+def fetch_available_models(api_base, api_key, timeout_seconds=30):
+    """Fetch available model IDs from GET /v1/models."""
+    base = normalize_api_base(api_base or DEFAULT_API_BASE_URL)
+    url = f"{base}/v1/models"
+    headers = {"Authorization": f"Bearer {api_key.strip()}"}
+    response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"获取模型列表失败 HTTP {response.status_code}: {response.text[:500]}"
+        )
+    data = response.json()
+    models = []
+    for item in data.get("data", []):
+        model_id = item.get("id", "")
+        if model_id:
+            models.append(model_id)
+    if not models:
+        raise RuntimeError("此接口没有可用模型")
+    return models
 
 
 AUTO_RATIO_PROMPTS = {
@@ -236,7 +253,7 @@ def image_bytes_to_tensor(image_bytes):
 
 
 def b64_json_to_tensor(b64_json):
-    """Decode API b64_json. APIYi may include a data URL prefix."""
+    """Decode API b64_json. ZHANGYUAPI may include a data URL prefix."""
     value = (b64_json or "").strip()
     if not value:
         raise ValueError("b64_json 为空")
@@ -254,10 +271,14 @@ def extract_image_references(text):
 
     refs = []
     data_pattern = r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+"
-    url_pattern = r"https?://[^\s)\]\"']+\.(?:png|jpg|jpeg|webp)(?:\?[^\s)\]\"']*)?"
+    url_pattern = r"https?://[^\s)\]\"']+\.(?:png|jpg|jpeg|webp|avif|gif)(?:\?[^\s)\]\"']*)*"
+    url_md_pattern = r"!\[[^\]]*\]\(\s*(https?://[^\s)]+)\s*\)"
+    url_img_pattern = r"<img[^>]+src=[\"'](https?://[^\s\"']+)[\"']"
 
     refs.extend(re.findall(data_pattern, text))
     refs.extend(match[0] if isinstance(match, tuple) else match for match in re.findall(url_pattern, text, re.I))
+    refs.extend(re.findall(url_md_pattern, text, re.I))
+    refs.extend(re.findall(url_img_pattern, text, re.I))
 
     seen = set()
     unique_refs = []
@@ -359,6 +380,14 @@ def safe_int(value, default, min_value=None, max_value=None):
     return number
 
 
+def normalize_api_base(api_base):
+    """Strip trailing slashes and /v1 suffix so callers can safely append /v1/..."""
+    base = (api_base or DEFAULT_API_BASE_URL).strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
 def normalize_prompt_text(value):
     if isinstance(value, list):
         return "\n".join(str(item).strip() for item in value if str(item).strip())
@@ -384,7 +413,7 @@ def emit_runtime_status(
             return
 
         PromptServer.instance.send_sync(
-            "comfyui_luck_gpt20_status",
+            "comfyui_zhangyuapi_status",
             {
                 "node_id": str(node_id),
                 "status": status,
@@ -400,8 +429,8 @@ def emit_runtime_status(
         pass
 
 
-class ComfyuiLuckGPT20Node:
-    """Comfyui-Luck gpt-2.0 text-to-image and image editing node."""
+class ComfyuiZhangyuAPINode:
+    """Comfyui-ZhangyuAPI text-to-image and image editing node."""
 
     MODELS = ["gpt-image-2-all"]
     ASPECT_RATIOS = [
@@ -462,7 +491,7 @@ class ComfyuiLuckGPT20Node:
     RETURN_TYPES = ("IMAGE", "STRING", "STRING")
     RETURN_NAMES = ("image", "response", "image_urls")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-Luck/gpt-2.0"
+    CATEGORY = "Comfyui-ZhangyuAPI/gpt-2.0"
 
     def _prompt_prefix(self, aspect_ratio):
         if aspect_ratio != "AUTO":
@@ -493,12 +522,15 @@ class ComfyuiLuckGPT20Node:
 
     def _download_image_url(self, url, timeout_seconds):
         headers = {
-            "User-Agent": "Comfyui-Luck gpt-2.0/1.0",
+            "User-Agent": "Comfyui-ZhangyuAPI/1.0",
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
-        response = apiyi_get(url, timeout_seconds, headers=headers)
+        response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
         response.raise_for_status()
-        return image_bytes_to_tensor(response.content)
+        try:
+            return image_bytes_to_tensor(response.content)
+        except Exception as exc:
+            raise RuntimeError(f"下载图片失败 (url={url[:200]}): {exc}") from exc
 
     def _parse_response_images(self, data, timeout_seconds):
         items = data.get("data")
@@ -557,7 +589,7 @@ class ComfyuiLuckGPT20Node:
         }
         if resolved_size:
             payload["size"] = resolved_size
-        return apiyi_post(
+        return ZHANGYUAPI_post(
             f"{api_base}/v1/images/generations",
             timeout_seconds,
             headers={**headers, "Content-Type": "application/json"},
@@ -576,7 +608,7 @@ class ComfyuiLuckGPT20Node:
             ("image[]", (filename, BytesIO(image_bytes), "image/png"))
             for filename, image_bytes in image_payloads
         ]
-        return apiyi_post(
+        return ZHANGYUAPI_post(
             f"{api_base}/v1/images/edits",
             timeout_seconds,
             headers=headers,
@@ -600,7 +632,7 @@ class ComfyuiLuckGPT20Node:
         }
         if resolved_size:
             payload["size"] = resolved_size
-        return apiyi_post(
+        return ZHANGYUAPI_post(
             f"{api_base}/v1/chat/completions",
             timeout_seconds,
             headers={**headers, "Content-Type": "application/json"},
@@ -612,7 +644,7 @@ class ComfyuiLuckGPT20Node:
         prompt = kwargs.get("prompt (提示词)", "")
         mode = kwargs.get("mode (模式)", "AUTO")
         model = kwargs.get("model (模型)", "gpt-image-2-all")
-        api_base = kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL).rstrip("/")
+        api_base = normalize_api_base(kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL))
         endpoint = kwargs.get("endpoint (端点)", "chat_completions (推荐)")
         aspect_ratio = kwargs.get("aspect_ratio (宽高比)", "AUTO")
         response_format = kwargs.get("response_format (响应格式)", "url")
@@ -630,7 +662,7 @@ class ComfyuiLuckGPT20Node:
         resolved_size = None
         size_control = "prompt_prefix"
         image_payloads = self._collect_images(kwargs)
-        print(f"[Comfyui-Luck gpt-2.0] effective prompt: {effective_prompt[:500]}")
+        print(f"[Comfyui-ZhangyuAPI] effective prompt: {effective_prompt[:500]}")
 
         if mode == "AUTO":
             actual_mode = "img2img" if image_payloads else "text2img"
@@ -644,7 +676,7 @@ class ComfyuiLuckGPT20Node:
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
         last_error = None
 
-        print(f"[Comfyui-Luck gpt-2.0] endpoint={endpoint}, mode={actual_mode}, model={model}, resolved_size={resolved_size}, seed={seed} (not sent to API)")
+        print(f"[Comfyui-ZhangyuAPI] endpoint={endpoint}, mode={actual_mode}, model={model}, resolved_size={resolved_size}, seed={seed} (not sent to API)")
         emit_runtime_status(unique_id, "running", "开始生成", 0.0, 0, retry_times, timeout_seconds)
 
         for attempt in range(1, retry_times + 1):
@@ -801,10 +833,10 @@ class ComfyuiLuckGPT20Node:
             retry_times,
             timeout_seconds,
         )
-        raise RuntimeError(f"Comfyui-Luck gpt-2.0 连续 {retry_times} 次失败，最后错误: {last_error}")
+        raise RuntimeError(f"Comfyui-ZhangyuAPI 连续 {retry_times} 次失败，最后错误: {last_error}")
 
 
-class ComfyuiLuckGPTImage2VipNode(ComfyuiLuckGPT20Node):
+class ComfyuiZhangyuAPIImage2VipNode(ComfyuiZhangyuAPINode):
     """gpt-image-2-vip node with documented 30-size controls."""
 
     MODELS = ["gpt-image-2-vip"]
@@ -844,14 +876,14 @@ class ComfyuiLuckGPTImage2VipNode(ComfyuiLuckGPT20Node):
             },
         }
 
-    CATEGORY = "Comfyui-Luck/gpt-image-2-vip"
+    CATEGORY = "Comfyui-ZhangyuAPI/gpt-image-2-vip"
 
     def generate(self, **kwargs):
         api_key = kwargs.get("api_key (API密钥)", "")
         prompt = kwargs.get("prompt (提示词)", "")
         mode = kwargs.get("mode (模式)", "AUTO")
         model = kwargs.get("model (模型)", "gpt-image-2-vip")
-        api_base = kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL).rstrip("/")
+        api_base = normalize_api_base(kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL))
         endpoint = kwargs.get("endpoint (端点)", "chat_completions (推荐)")
         image_size = kwargs.get("image_size (VIP分辨率)", "2K Recommended")
         aspect_ratio = kwargs.get("aspect_ratio (VIP宽高比)", "16:9")
@@ -885,7 +917,7 @@ class ComfyuiLuckGPTImage2VipNode(ComfyuiLuckGPT20Node):
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
         last_error = None
 
-        print(f"[Comfyui-Luck gpt-image-2-vip] endpoint={endpoint}, mode={actual_mode}, size={resolved_size}, seed={seed} (not sent to API)")
+        print(f"[Comfyui-ZhangyuAPI-image-2-vip] endpoint={endpoint}, mode={actual_mode}, size={resolved_size}, seed={seed} (not sent to API)")
         emit_runtime_status(unique_id, "running", "开始生成", 0.0, 0, retry_times, timeout_seconds)
 
         for attempt in range(1, retry_times + 1):
@@ -1042,10 +1074,10 @@ class ComfyuiLuckGPTImage2VipNode(ComfyuiLuckGPT20Node):
             retry_times,
             timeout_seconds,
         )
-        raise RuntimeError(f"Comfyui-Luck gpt-image-2-vip 连续 {retry_times} 次失败，最后错误: {last_error}")
+        raise RuntimeError(f"Comfyui-ZhangyuAPI-image-2-vip 连续 {retry_times} 次失败，最后错误: {last_error}")
 
 
-class ComfyuiLuckGPTImage2Node:
+class ComfyuiZhangyuAPIImage2Node:
     """Official gpt-image-2 node with real size, quality, format, and mask controls."""
 
     MODELS = ["gpt-image-2"]
@@ -1092,6 +1124,7 @@ class ComfyuiLuckGPTImage2Node:
                 "aspect_ratio (宽高比)": (cls.ASPECT_RATIOS, {"default": "16:9"}),
                 "custom_size (仅custom填写: 宽x高)": ("STRING", {"default": "1600x1200", "multiline": False}),
                 "quality (画质)": (["auto", "low", "medium", "high"], {"default": "auto"}),
+                "response_format (响应格式)": (["url", "b64_json"], {"default": "b64_json"}),
                 "output_format (输出格式)": (["png", "jpeg", "webp"], {"default": "png"}),
                 "output_compression (压缩率)": ("INT", {"default": 85, "min": 0, "max": 100}),
                 "seed (种子)": (
@@ -1122,7 +1155,7 @@ class ComfyuiLuckGPTImage2Node:
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image", "response")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-Luck/gpt-image-2"
+    CATEGORY = "Comfyui-ZhangyuAPI/gpt-image-2"
 
     def _collect_images(self, kwargs):
         image_payloads = []
@@ -1133,7 +1166,7 @@ class ComfyuiLuckGPTImage2Node:
             image_payloads.append((f"image_{i:02d}.png", tensor_to_png_bytes(tensor)))
         return image_payloads
 
-    def _payload_fields(self, model, prompt, size, quality, output_format, output_compression):
+    def _payload_fields(self, model, prompt, size, quality, response_format, output_format, output_compression):
         fields = {
             "model": model,
             "prompt": prompt,
@@ -1142,13 +1175,15 @@ class ComfyuiLuckGPTImage2Node:
             fields["size"] = size
         if quality != "auto":
             fields["quality"] = quality
+        if response_format != "url":
+            fields["response_format"] = response_format
         if output_format != "png":
             fields["output_format"] = output_format
             fields["output_compression"] = output_compression
         return fields
 
     def _request_text2img(self, api_base, headers, fields, timeout_seconds):
-        return apiyi_post(
+        return ZHANGYUAPI_post(
             f"{api_base}/v1/images/generations",
             timeout_seconds,
             headers={**headers, "Content-Type": "application/json"},
@@ -1164,7 +1199,7 @@ class ComfyuiLuckGPTImage2Node:
             files.append(("mask", ("mask.png", BytesIO(mask_bytes), "image/png")))
 
         data = {key: str(value) for key, value in fields.items()}
-        return apiyi_post(
+        return ZHANGYUAPI_post(
             f"{api_base}/v1/images/edits",
             timeout_seconds,
             headers=headers,
@@ -1172,7 +1207,7 @@ class ComfyuiLuckGPTImage2Node:
             files=files,
         )
 
-    def _parse_response_images(self, data):
+    def _parse_response_images(self, data, timeout_seconds):
         items = data.get("data")
         if not items:
             raise RuntimeError(f"API 未返回图片数据: {data}")
@@ -1185,18 +1220,34 @@ class ComfyuiLuckGPTImage2Node:
                 continue
             if item.get("b64_json"):
                 tensors.append(b64_json_to_tensor(item["b64_json"]))
+                continue
+            if item.get("url"):
+                url = item["url"]
+                tensors.append(self._download_image_url(url, timeout_seconds))
 
         if not tensors:
             raise RuntimeError(f"未能解析 gpt-image-2 响应图片: {data}")
 
         return torch.cat(tensors, dim=0)
 
+    def _download_image_url(self, url, timeout_seconds):
+        headers = {
+            "User-Agent": "Comfyui-ZhangyuAPI/1.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
+        response.raise_for_status()
+        try:
+            return image_bytes_to_tensor(response.content)
+        except Exception as exc:
+            raise RuntimeError(f"下载图片失败 (url={url[:200]}): {exc}") from exc
+
     def generate(self, **kwargs):
         api_key = kwargs.get("api_key (API密钥)", "")
         prompt = kwargs.get("prompt (提示词)", "")
         mode = kwargs.get("mode (模式)", "AUTO")
         model = kwargs.get("model (模型)", "gpt-image-2")
-        api_base = kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL).rstrip("/")
+        api_base = normalize_api_base(kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL))
         image_size = kwargs.get(
             "image_size (分辨率)",
             kwargs.get("size_ratio (尺寸/比例)", kwargs.get("size (尺寸)", "2K")),
@@ -1227,7 +1278,7 @@ class ComfyuiLuckGPTImage2Node:
 
             mode = "AUTO"
             model = "gpt-image-2"
-            api_base = shifted_api_base.rstrip("/")
+            api_base = normalize_api_base(shifted_api_base)
             image_size = shifted_image_size
             aspect_ratio = shifted_aspect_ratio
             custom_size = shifted_custom_size
@@ -1237,6 +1288,7 @@ class ComfyuiLuckGPTImage2Node:
             kwargs["timeout_seconds (超时秒数)"] = 360
 
         quality = safe_choice(kwargs.get("quality (画质)", "auto"), ["auto", "low", "medium", "high"], "auto")
+        response_format = safe_choice(kwargs.get("response_format (响应格式)", "b64_json"), ["url", "b64_json"], "b64_json")
         output_format = safe_choice(kwargs.get("output_format (输出格式)", "png"), ["png", "jpeg", "webp"], "png")
         output_compression = safe_int(kwargs.get("output_compression (压缩率)", 85), 85, 0, 100)
         seed = safe_int(kwargs.get("seed (种子)", 0), 0, 0, 2147483647)
@@ -1274,11 +1326,12 @@ class ComfyuiLuckGPTImage2Node:
             clean_prompt,
             effective_size,
             quality,
+            response_format,
             output_format,
             output_compression,
         )
 
-        print(f"[Comfyui-Luck gpt-image-2] mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, fields={fields}, seed={seed} (not sent to API)")
+        print(f"[Comfyui-ZhangyuAPI-image-2] mode={actual_mode}, image_size={image_size}, aspect_ratio={aspect_ratio}, fields={fields}, seed={seed} (not sent to API)")
         emit_runtime_status(unique_id, "running", "开始生成", 0.0, 0, retry_times, timeout_seconds)
 
         last_error = None
@@ -1323,7 +1376,7 @@ class ComfyuiLuckGPTImage2Node:
                     raise RuntimeError(last_error)
 
                 data = response.json()
-                image_tensor = self._parse_response_images(data)
+                image_tensor = self._parse_response_images(data, timeout_seconds)
                 elapsed = time.time() - start_ts
                 response_info = {
                     "status": "success",
@@ -1391,17 +1444,71 @@ class ComfyuiLuckGPTImage2Node:
             retry_times,
             timeout_seconds,
         )
-        raise RuntimeError(f"Comfyui-Luck gpt-image-2 连续 {retry_times} 次失败，最后错误: {last_error}")
+        raise RuntimeError(f"Comfyui-ZhangyuAPI-image-2 连续 {retry_times} 次失败，最后错误: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# PromptServer routes — registered once at import time
+# ---------------------------------------------------------------------------
+
+try:
+    import asyncio
+
+    import server as _comfy_server
+    from aiohttp import web as _aiohttp_web
+
+    if _comfy_server is not None and _comfy_server.PromptServer.instance is not None:
+        _routes = _comfy_server.PromptServer.instance.routes
+
+        @_routes.post("/luck_fetch_models")
+        async def _luck_fetch_models_route(request):
+            try:
+                data = await request.json()
+                api_base = data.get("api_base", "")
+                api_key = data.get("api_key", "")
+
+                if not api_key or not api_key.strip():
+                    return _aiohttp_web.json_response(
+                        {"status": "error", "message": "API Key 不能为空"},
+                        status=400,
+                    )
+
+                loop = asyncio.get_event_loop()
+                models = await loop.run_in_executor(
+                    None,
+                    lambda: fetch_available_models(
+                        api_base,
+                        api_key.strip(),
+                        timeout_seconds=30,
+                    ),
+                )
+
+                return _aiohttp_web.json_response({"status": "success", "models": models})
+            except RuntimeError as exc:
+                msg = str(exc)
+                print(f"Comfyui-ZhangyuAPI: fetch models error: {msg}")
+                return _aiohttp_web.json_response(
+                    {"status": "error", "message": msg},
+                    status=502,
+                )
+            except Exception as exc:
+                print(f"Comfyui-ZhangyuAPI: fetch models error: {exc}")
+                return _aiohttp_web.json_response(
+                    {"status": "error", "message": str(exc)},
+                    status=500,
+                )
+except Exception as _exc:
+    print(f"Warning: Could not register model-fetch route: {_exc}")
 
 
 NODE_CLASS_MAPPINGS = {
-    "ComfyuiLuckGPT20Node": ComfyuiLuckGPT20Node,
-    "ComfyuiLuckGPTImage2VipNode": ComfyuiLuckGPTImage2VipNode,
-    "ComfyuiLuckGPTImage2Node": ComfyuiLuckGPTImage2Node,
+    "ComfyuiZhangyuAPINode": ComfyuiZhangyuAPINode,
+    "ComfyuiZhangyuAPIImage2VipNode": ComfyuiZhangyuAPIImage2VipNode,
+    "ComfyuiZhangyuAPIImage2Node": ComfyuiZhangyuAPIImage2Node,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ComfyuiLuckGPT20Node": "Comfyui-Luck gpt-2.0 all",
-    "ComfyuiLuckGPTImage2VipNode": "Comfyui-Luck gpt-image-2-vip",
-    "ComfyuiLuckGPTImage2Node": "Comfyui-Luck gpt-image-2",
+    "ComfyuiZhangyuAPINode": "Comfyui-ZhangyuAPI all",
+    "ComfyuiZhangyuAPIImage2VipNode": "Comfyui-ZhangyuAPI-image-2-vip",
+    "ComfyuiZhangyuAPIImage2Node": "Comfyui-ZhangyuAPI-image-2",
 }
