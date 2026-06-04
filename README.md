@@ -1,323 +1,250 @@
 # Comfyui-ZhangyuAPI
 
-ZhangyuAPI GPT 图像模型的 ComfyUI 自定义节点包，包含出图节点和提示词控制节点。
+ComfyUI 自定义节点，对接 **zhangyuapi.com** 它允许你在 ComfyUI 工作流中直接调用任意兼容 OpenAI Images API 格式的第三方服务。
 
-## 节点概览
+## 📖 简介
 
-| 节点 | 模型 | 适合场景 | 尺寸控制 |
-|---|---|---|---|
-| `Comfyui-ZhangyuAPI all` | `gpt-image-2-all` | 便宜、快、中文友好、文生图/改图/多图融合 | 只能把比例写进 prompt |
-| `Comfyui-ZhangyuAPI-image-2-vip` | `gpt-image-2-vip` | 根据需求选择、需要 30 档尺寸或 4K | 真正传 30 档 `size` API 参数 |
-| `Comfyui-ZhangyuAPI-image-2` | `gpt-image-2` | 需要真实 size、2K/4K、自定义尺寸、quality、mask | 真正传 `size` API 参数 |
+Comfyui-ZhangyuAPI 提供 5 个节点，覆盖从"想生成什么"到"怎么生成"的完整链路——提示词优化 → 图像生成 → 视频生成 → 文本编辑。所有节点通过 OpenAI 兼容 REST API 通信，支持 HTTP/2 直连、自适应轮询和自动重试。
 
-| 提示词节点 | 默认模型 | 适合场景 |
-|---|---|---|
-| `GPT-Image-2 文生图提示词控制器` | `gemini-3.5-flash` | 将文字需求整理为更适合 GPT-Image-2 的结构化生图提示词 |
-| `图生图提示词控制器` | `gemini-3.5-flash` | 读取最多 5 张参考图和可选主体图，生成带风格、构图、版式约束的出图提示词 |
-| `文本停留编辑器` | - | 工作流执行中暂停，手动编辑文本后继续 |
+**核心亮点：**
 
-提示词控制器使用 OpenAI 兼容 `POST /v1/chat/completions` 接口，鉴权格式为 `Authorization: Bearer YOUR_API_KEY`。模型下拉选择模型。
+- ✅ **GPT-Image-2 原生节点** — 支持 size / quality / format / mask 全参数
+- ✅ **通用生图接口** — 兼容 DALL-E / FLUX / SD / Midjourney 等任意模型
+- ✅ **视频生成** — Sora / Veo / Kling 等视频模型，自适应异步轮询
+- ✅ **提示词优化** — LLM 根据用户需求自动生成结构化生图提示词
+- ✅ **文本停留编辑** — 工作流执行中暂停，手动编辑文本后继续
 
-`图生图提示词控制器` 的 `reference_image_01` 必填，`reference_image_02` 到 `reference_image_05` 可选；多张参考图会一起发送给多模态模型综合分析。`subject_image` 仍然是可选主体图，用来锁定最终画面的核心产品或人物。
+## ✨ 特性
 
-## 多图参考的推荐接法
+| 特性 | 说明 |
+|------|------|
+| 通用兼容 | 兼容 `/v1/images/generations`、`/v1/images/edits`、`/v1/videos`、`/v1/chat/completions` 端点 |
+| 异步轮询 | API 返回任务 ID 后自动自适应轮询（1s → 3s → 8s → 15s），最多等待超时上限 |
+| HTTP/2 直连 | 强制直连绕过系统代理，低延迟高吞吐 |
+| 多图输出 | 支持一次生成多张图片（n 参数，最多 10 张） |
+| 多图输入 | 图生图模式支持最多 8 张参考图 + mask 遮罩 |
+| 灵活参数 | 支持 model、size、quality、aspect_ratio、output_format、seed、steps、cfg_scale 等 |
+| 模型感知校验 | 自动检测模型家族（GPT / DALL-E / SD / FLUX / Midjourney），适配合法参数 |
+| 进度条 | 前端实时显示生成进度，自适应曲线加速感知 |
+| 自动重试 | 408 / 429 / 5xx 自动退避重试 |
 
-- 只把图片接到 `图生图提示词控制器`：只做图像理解和提示词增强，后面可以按文生图使用优化后的 prompt。
-- 同一批图片同时接到后面的出图节点：才是真正的多图参考 / 多图编辑 / 多图融合。
-- 5 张图以内，优先接 `Comfyui-ZhangyuAPI-image-2` 的 `image_01` 到 `image_05`，因为它支持真实 size、quality 和 mask。
-- 超过 5 张图时，可以改接 `Comfyui-ZhangyuAPI all` 或 `Comfyui-ZhangyuAPI-image-2-vip`，它们最多支持 `image_01` 到 `image_14`。
+## 🔧 安装
 
-完整链路示例：
-
-```text
-5张参考图
-  ├─ 接到 图生图提示词控制器 reference_image_01~reference_image_05
-  └─ 同时接到 Comfyui-ZhangyuAPI-image-2 image_01~image_05
-
-图生图提示词控制器 optimized_prompt
-  └─ 接到 Comfyui-ZhangyuAPI-image-2 prompt
-```
-
-如果其中一张图是必须锁定的主体图，可以额外接到 `subject_image`，并放在后面出图节点的 `image_01`。
-
-## 暂停编辑后再出图的推荐接法
-
-```text
-提示词控制器 optimized_prompt
-  └─ 接到 文本停留编辑器 text_list
-
-文本停留编辑器 edited_text
-  └─ 接到 出图节点 prompt
-```
-
-`edited_text` 是单条字符串，适合接普通出图节点的 prompt。`edited_texts` 是列表输出，保留给批量文本工作流使用。
-
-运行时请对最终 `PreviewImage` 或 `SaveImage` 发起队列执行。流程停在 `文本停留编辑器` 后，点击节点上的 `Continue` 即可让当前执行继续到后面的出图节点；不要再次点击主运行按钮，否则 ComfyUI 会重新排队并重新执行上游提示词增强。
-
-## 安装
-
-1. 把整个目录复制到 ComfyUI 的 `custom_nodes` 目录。
-2. 安装依赖：
+进入 ComfyUI 的 `custom_nodes` 目录：
 
 ```bash
-python3 -m pip install -r requirements.txt
+cd ComfyUI/custom_nodes/
+git clone https://github.com/your-repo/Comfyui-ZhangyuAPI.git
+cd Comfyui-ZhangyuAPI
+pip install -r requirements.txt
 ```
 
-3. 重启 ComfyUI，搜索 `zhangyuapi`。
+重启 ComfyUI，搜索 `zhangyuapi` 即可找到所有节点。
 
-## 获取模型列表
+## 🎮 节点说明
 
-每个出图节点都带有 **🔄 获取模型** 按钮。填入 API Key 后点击该按钮，节点会调用 `GET /v1/models` 拉取可用模型列表，并填充到 `model (模型)` 下拉框中，避免因模型名称不存在导致接口报错。
+### 生图节点
 
-## 运行时状态栏
+| 节点 | 分类 | 说明 |
+|------|------|------|
+| `Comfyui-ZhangyuAPI-image-2` | 生图 | GPT-Image-2 原生节点，支持 size / quality / aspect_ratio / mask |
+| `ComfyUI-zhangyuapi-通用生图接口` | 生图 | 全平台通用，DALL-E / FLUX / SD / Midjourney 兼容 |
 
-所有出图节点和提示词控制器节点在执行时，会在节点下方显示运行时状态栏：
+### 视频节点
 
-- **等待执行** — 节点空闲，等待队列调度。
-- **运行中 · 12.5s** — 显示当前耗时与进度条，重试时会标注第几次尝试。
-- **完成 · 45.2s** — 绿色进度条满格。
-- **失败 · 30.0s** — 红色标记，提示错误原因。
+| 节点 | 分类 | 说明 |
+|------|------|------|
+| `ComfyUI-zhangyuapi-视频生成 🧪测试中` | 视频 | Sora / Veo / Kling 等视频模型，异步轮询 |
 
-## 节点 1：Comfyui-ZhangyuAPI all
+### 文本节点
 
-使用 `gpt-image-2-all`。
+| 节点 | 分类 | 说明 |
+|------|------|------|
+| `ComfyUI-zhangyuapi-提示词优化器 🧪测试中` | 文本 | 文字需求 → 结构化生图提示词，支持参考图模式 |
+| `ComfyUI-zhangyuapi-文本停留编辑器 🧪测试中` | 文本 | 工作流执行中暂停，手动编辑文本后继续 |
 
-特点：
+---
 
-- 统一按次计费，约 ¥0.03/张。
-- ChatGPT 网页线，约 30-60 秒，出图较快。
-- 支持文生图、单图改图、多图融合、自然语言改图。
-- 默认走 `chat_completions (推荐)`，走 `POST /v1/chat/completions`，提示词遵循更好。
-- 可切到 `images_api (兼容)`，走 `/v1/images/generations` 或 `/v1/images/edits`。
-- 不支持真实 `size`、`quality`、`n` API 字段，节点不会发送这些字段。
-- 支持最多 14 张参考图（`image_01` 到 `image_14`）。
+### Comfyui-ZhangyuAPI-image-2
 
-比例控制只做很短的 prompt 前置，不加额外噪音。`gpt-image-2-all` 不传真实 `size`，但比例下拉已和提示词控制器统一，支持 `AUTO`、`1:4`、`4:1`、`1:8`、`8:1`、`1:1`、`1:2`、`2:1`、`1:3`、`3:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`9:21`、`21:9`。
+**输入参数**
 
-| 需求 | 前置写法 |
-|---|---|
-| 方形 | `1024×1024 方图 / 1:1 方形构图` |
-| 横版 | `横版 16:9 / 宽屏 16:9 电影画幅` |
-| 竖版 | `竖版 9:16 / 手机海报 9:16` |
-| 超宽横幅 | `横幅 21:9 超宽银幕` |
-| 经典印刷 | `4:3 标准画幅` 或 `3:2 经典画幅` |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api_key (API密钥)` | STRING | — | zhangyuapi.com 的 API Key |
+| `prompt (提示词)` | STRING | — | 正向提示词（多行文本） |
+| `mode (模式)` | ENUM | `AUTO` | `AUTO` / `text2img` / `img2img` |
+| `model (模型)` | ENUM | `gpt-image-2` | 模型选择 |
+| `custom_model (自定义模型名)` | STRING | — | 自定义模型名，填写后覆盖下拉选择 |
+| `n (生成数量)` | INT | 1 | 生成图片数量（1~5） |
+| `api_base (接口域名)` | STRING | `https://zhangyuapi.com/v1` | API 基础地址 |
+| `image_size (分辨率)` | ENUM | `1K` | `auto` / `1K` / `2K` / `4K` |
+| `aspect_ratio (宽高比)` | ENUM | `1:1` | `AUTO` / `1:1` / `16:9` / `9:16` 等 |
+| `quality (画质)` | ENUM | `auto` | `auto` / `low` / `medium` / `high` |
+| `response_format (响应格式)` | ENUM | `b64_json` | `b64_json` / `url` |
+| `output_format (输出格式)` | ENUM | `jpeg` | `png` / `jpeg` / `webp` |
+| `output_compression (压缩率)` | INT | 85 | 0~100 |
+| `seed (种子)` | INT | 0 | 0 表示随机 |
+| `timeout_seconds (超时秒数)` | INT | 360 | 60~1800 |
+| `retry_times (重试次数)` | INT | 3 | 1~10 |
 
-控件说明：
+**可选输入**：`image_01` ~ `image_08`（参考图）、`mask`（遮罩）
 
-| 控件 | 类型 | 默认值 |
-|---|---|---|
-| `api_key (API密钥)` | 文本 | (空) |
-| `prompt (提示词)` | 多行文本 | (空) |
-| `mode (模式)` | 下拉 | `AUTO`（可选 `text2img` / `img2img`） |
-| `model (模型)` | 下拉 | `gpt-image-2-all` |
-| `api_base (接口域名)` | 下拉 | `https://zhangyuapi.com/v1` |
-| `endpoint (端点)` | 下拉 | `chat_completions (推荐)` |
-| `aspect_ratio (宽高比)` | 下拉 | `AUTO` |
-| `response_format (响应格式)` | 下拉 | `url` |
-| `seed (种子)` | 整数 | `0` |
-| `timeout_seconds (超时秒数)` | 整数 | `300`（30-1200） |
-| `retry_times (重试次数)` | 整数 | `3`（1-10） |
+**输出端口**
 
-返回：`image`、`response`（JSON）、`image_urls`（换行分隔的 URL 列表）。
+| 端口 | 类型 | 说明 |
+|------|------|------|
+| `image` | IMAGE | 生成的图像张量 |
+| `response` | STRING | 请求摘要（模型、耗时、URL 等关键信息） |
+| `image_urls` | STRING | 图片 URL 列表 |
+| `chats` | STRING | API 原始响应（已剔除 base64 数据） |
+| `model_list` | STRING | 当前可用模型列表 |
 
-说明：
+---
 
-- `response_format` 只在 `images_api (兼容)` 端点里发送。
-- 默认 `chat_completions (推荐)` 端点会从 `choices[0].message.content` 里提取图片 URL 或 data URL。
-- URL 输出通常是临时 CDN 链接，约 1 天有效；需要长期保存时请尽快转存。
-- `408`、`429`、`5xx` 会按 `retry_times` 自动重试。
+### ComfyUI-zhangyuapi-通用生图接口
 
-## 节点 2：Comfyui-ZhangyuAPI-image-2-vip
+除 GPT-Image-2 专属参数外，额外支持：
 
-使用 `gpt-image-2-vip`。
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `negative_prompt (反向提示词)` | STRING | — | 反向提示词 |
+| `quality (画质)` | ENUM | `standard` | `standard` / `hd` |
+| `style (风格)` | ENUM | `vivid` | `vivid` / `natural` |
+| `steps (采样步数)` | INT | 30 | 1~150（SD/FLUX） |
+| `cfg_scale (提示词引导强度)` | FLOAT | 7.0 | 1.0~30.0（SD/FLUX） |
+| `sampler (采样器)` | ENUM | `auto` | 采样器选择 |
+| `denoising_strength (重绘强度)` | FLOAT | 1.0 | 0.0~1.0（img2img） |
+| `mj_ar (MJ宽高比)` | ENUM | `auto` | Midjourney `--ar` 映射 |
+| `mj_stylize (MJ风格化)` | INT | 100 | Midjourney `--stylize` 映射 |
+| `mj_chaos (MJ混乱度)` | INT | 0 | Midjourney `--chaos` 映射 |
+| `mj_weird (MJ怪异度)` | INT | 0 | Midjourney `--weird` 映射 |
 
-特点：
+> 节点会自动检测模型家族并适配合法参数：DALL-E 3 限制 n=1、Midjourney 映射到对应 `--` 参数等。
 
-- 统一按次计费，约 ¥0.03/张，所有 size 同价。
-- Codex 官逆线，约 90-150 秒，适合必须锁定尺寸或需要 4K 的场景。
-- 支持文生图、单图改图、多图融合、自然语言改图。
-- 支持 `chat_completions (推荐)` 与 `images_api (兼容)` 两种端点。
-- 真正发送 `size` 字段；不支持 `quality` 和 `n`，节点不会发送这些字段。
-- `b64_json` 已带 `data:image/png;base64,` 前缀，节点会自动兼容解码。
-- 支持最多 14 张参考图（`image_01` 到 `image_14`）。
-- VIP 的比例严格跟随 API 文档 30 档真实尺寸，只提供 `1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`21:9`。如果要 `9:21`、`3:1`、`1:3` 等更多比例，请用 `gpt-image-2-all` 写进 prompt，或用 `Comfyui-ZhangyuAPI-image-2` 传真实合法 size。
+---
 
-尺寸换算：
+### ComfyUI-zhangyuapi-视频生成 🧪测试中
 
-| vip_aspect_ratio | 1K Fast | 2K Recommended | 4K Detail |
-|---|---:|---:|---:|
-| `1:1` | `1280x1280` | `2048x2048` | `2880x2880` |
-| `2:3` | `848x1280` | `1360x2048` | `2336x3520` |
-| `3:2` | `1280x848` | `2048x1360` | `3520x2336` |
-| `3:4` | `960x1280` | `1536x2048` | `2480x3312` |
-| `4:3` | `1280x960` | `2048x1536` | `3312x2480` |
-| `4:5` | `1024x1280` | `1632x2048` | `2560x3216` |
-| `5:4` | `1280x1024` | `2048x1632` | `3216x2560` |
-| `9:16` | `720x1280` | `1152x2048` | `2160x3840` |
-| `16:9` | `1280x720` | `2048x1152` | `3840x2160` |
-| `21:9` | `1280x544` | `2048x864` | `3840x1632` |
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `prompt (提示词)` | STRING | — | 视频描述 |
+| `model (模型)` | ENUM | `auto (自动选择)` | 模型选择 |
+| `seconds (时长秒数)` | INT | 8 | 4~60 |
+| `size (分辨率)` | ENUM | `1280x720` | 视频分辨率 |
+| `aspect_ratio (画面比例)` | ENUM | `16:9` | `16:9` / `9:16` / `1:1` |
+| `negative_prompt (反向提示词)` | STRING | — | 反向提示词 |
 
-控件说明：
+**输出**：`video`（视频文件）、`response`（JSON 摘要）
 
-| 控件 | 类型 | 默认值 |
-|---|---|---|
-| `api_key (API密钥)` | 文本 | (空) |
-| `prompt (提示词)` | 多行文本 | (空) |
-| `mode (模式)` | 下拉 | `AUTO` |
-| `model (模型)` | 下拉 | `gpt-image-2-vip` |
-| `api_base (接口域名)` | 下拉 | `https://zhangyuapi.com/v1` |
-| `endpoint (端点)` | 下拉 | `chat_completions (推荐)` |
-| `image_size (VIP分辨率)` | 下拉 | `2K Recommended` |
-| `aspect_ratio (VIP宽高比)` | 下拉 | `16:9` |
-| `response_format (响应格式)` | 下拉 | `url` |
-| `seed (种子)` | 整数 | `0` |
-| `timeout_seconds (超时秒数)` | 整数 | `300`（30-1200） |
-| `retry_times (重试次数)` | 整数 | `3`（1-10） |
+---
 
-返回：`image`、`response`（JSON）、`image_urls`（换行分隔的 URL 列表）。
+### ComfyUI-zhangyuapi-提示词优化器 🧪测试中
 
-说明：
+将用户的自然语言需求转化为结构化生图提示词。支持：
 
-- 节点会把上表解析成真实 `size` 字段发送给 API。
-- `gpt-image-2-vip` 不接受表外尺寸；需要任意合法自定义尺寸时，请使用 `Comfyui-ZhangyuAPI-image-2`。
-- `408`、`429`、`5xx` 会按 `retry_times` 自动重试。
+- **文本模式**：输入文字需求 → LLM 生成优化后的提示词
+- **参考图模式**：上传 1~5 张参考图 → LLM 分析风格/构图/版式 → 生成约束提示词
+- **流式输出**：可开启 `stream` 实时查看 LLM 生成过程
+- **预设系统提示词**：内置电商海报、社交媒体封面、纯视觉画面等预设
 
-## 节点 3：Comfyui-ZhangyuAPI-image-2
+| 关键参数 | 说明 |
+|----------|------|
+| `user_prompt (用户需求)` | 自然语言描述想要生成什么 |
+| `model (模型)` | LLM 模型选择 |
+| `stream (流式输出)` | 是否开启流式 |
+| `temperature (创造性)` | 0.0~2.0 |
+| `max_tokens (最大长度)` | 64~32768 |
+| `preset (预设)` | 选择内置系统提示词预设 |
+| `reference_image_01~05` | 参考图（触发参考图模式） |
 
-使用官方契约的 `gpt-image-2`。
+---
 
-特点：
+### ComfyUI-zhangyuapi-文本停留编辑器 🧪测试中
 
-- 真正传 `size` 参数，面板按 Nano 风格拆成 `image_size (分辨率)` + `aspect_ratio (宽高比)`。
-- 只使用 Images API（`/v1/images/generations` 或 `/v1/images/edits`），无端点切换。
-- `quality`：`auto`、`low`、`medium`、`high`。
-- `response_format`：`url`、`b64_json`（默认 `b64_json`）。
-- `output_format`：`png`、`jpeg`、`webp`。
-- `output_compression`：`jpeg` / `webp` 时可用，范围 0-100。
-- 支持最多 5 张参考图（`image_01` 到 `image_05`）。
-- 支持可选 `mask` 局部重绘，透明区域 = 要重绘，不透明区域 = 保留。
+工作流执行到该节点时暂停，弹出编辑器让用户手动修改文本，确认后继续执行。适合需要人工审核或调整中间文本的场景。
 
-尺寸换算：
+## 📋 工作流示例
 
-| aspect_ratio | 1K | 2K | 4K |
-|---|---:|---:|---:|
-| `AUTO` | 不传 size | 不传 size | 不传 size |
-| `1:4` | `480x1440` | `672x2016` | `1280x3840` |
-| `4:1` | `1440x480` | `2016x672` | `3840x1280` |
-| `1:8` | `480x1440` | `672x2016` | `1280x3840` |
-| `8:1` | `1440x480` | `2016x672` | `3840x1280` |
-| `1:1` | `1024x1024` | `2048x2048` | `2880x2880` |
-| `1:2` | `720x1440` | `1024x2048` | `1920x3840` |
-| `2:1` | `1440x720` | `2048x1024` | `3840x1920` |
-| `1:3` | `480x1440` | `672x2016` | `1280x3840` |
-| `3:1` | `1440x480` | `2016x672` | `3840x1280` |
-| `2:3` | `768x1152` | `1440x2160` | `2304x3456` |
-| `3:2` | `1152x768` | `2160x1440` | `3456x2304` |
-| `3:4` | `768x1024` | `1536x2048` | `2448x3264` |
-| `4:3` | `1024x768` | `2048x1536` | `3264x2448` |
-| `4:5` | `768x960` | `1536x1920` | `2304x2880` |
-| `5:4` | `960x768` | `1920x1536` | `2880x2304` |
-| `9:16` | `720x1280` | `1152x2048` | `2160x3840` |
-| `16:9` | `1280x720` | `2048x1152` | `3840x2160` |
-| `9:21` | `640x1488` | `960x2240` | `1648x3840` |
-| `21:9` | `1344x576` | `2464x1056` | `3808x1632` |
+### 文生图
 
-控件说明：
-
-| 控件 | 类型 | 默认值 |
-|---|---|---|
-| `api_key (API密钥)` | 文本 | (空) |
-| `prompt (提示词)` | 多行文本 | (空) |
-| `mode (模式)` | 下拉 | `AUTO`（可选 `text2img` / `img2img`） |
-| `model (模型)` | 下拉 | `gpt-image-2` |
-| `api_base (接口域名)` | 下拉 | `https://zhangyuapi.com/v1` |
-| `image_size (分辨率)` | 下拉 | `2K`（可选 `auto` / `1K` / `4K` / `custom`） |
-| `aspect_ratio (宽高比)` | 下拉 | `16:9` |
-| `custom_size (仅custom填写: 宽x高)` | 文本 | `1600x1200` |
-| `quality (画质)` | 下拉 | `auto` |
-| `response_format (响应格式)` | 下拉 | `b64_json` |
-| `output_format (输出格式)` | 下拉 | `png` |
-| `output_compression (压缩率)` | 整数 | `85`（0-100） |
-| `seed (种子)` | 整数 | `0` |
-| `timeout_seconds (超时秒数)` | 整数 | `360`（60-1800） |
-| `retry_times (重试次数)` | 整数 | `3`（1-10） |
-
-返回：`image`、`response`（JSON）。
-
-说明：
-
-- `aspect_ratio` 列表和提示词控制器保持一致：`AUTO`、`1:4`、`4:1`、`1:8`、`8:1`、`1:1`、`1:2`、`2:1`、`1:3`、`3:1`、`2:3`、`3:2`、`3:4`、`4:3`、`4:5`、`5:4`、`9:16`、`16:9`、`9:21`、`21:9`。
-- `auto (不传size)` 或 `aspect_ratio=AUTO` 会让 API 自适应。
-- `gpt-image-2` 官方限制长边/短边 ≤ 3:1，所以 `1:4`、`4:1`、`1:8`、`8:1` 会自动收敛到最接近的合法边界尺寸，不会硬传非法比例。
-- `4K` 档位尽量取合法大尺寸；`4K + 1:1` 不是 `3840x3840`，因为总像素会超官方上限，所以使用 `2880x2880`。
-- 超过 `2560x1440` 总像素量的输出，官方提示属于实验性，可能更慢或更容易超时。
-- `gpt-image-2` 返回的 `b64_json` 是纯 base64，不带 `data:image/...;base64,` 前缀；节点会自动解码成 ComfyUI 图片。
-- 节点不会发送 `input_fidelity`。
-- 节点不会发送 `background` / `moderation`，使用 API 默认值。
-- `408`、`429`、`5xx` 会按 `retry_times` 自动重试。`408 Timeout` 通常是上游生成任务超时，不是节点参数填错。
-
-`custom_size` 只在 `image_size` 选择 `custom (自定义)` 时填写，格式如 `1600x1200`、`3072x1024`、`1024x3072`。选择 1K/2K/4K 时会忽略这个输入框。
-
-`custom_size` 约束：
-
-- 最大边 ≤ 3840px。
-- 宽和高都是 16 的倍数。
-- 长边/短边 ≤ 3:1，也就是说 3:1 和 1:3 都可以，超过不行。
-- 总像素在 655,360 到 8,294,400 之间。
-
-`background` / `moderation` 说明：
-
-- `background`: OpenAI Images API 的背景控制字段。`gpt-image-2` 不支持 `transparent`，而 `auto` / `opaque` 对大多数普通出图区别不明显，所以节点默认不传。
-- `moderation`: 文生图审核强度，通常是 `auto` 或 `low`。它不属于图片编辑接口的核心字段，日常使用默认即可。
-
-## API 地址
-
-默认使用 `https://zhangyuapi.com/v1`。`api_base (接口域名)` 下拉框支持手动输入其他兼容 OpenAI 接口的地址。
-
-节点底层使用自定义 `requests.Session`，按 HTTP/1.1 行为请求接口，连接超时固定 30 秒，读取超时由节点面板控制，减少长耗时生成时的中断。
-
-鉴权格式：
-
-```text
-Authorization: Bearer YOUR_API_KEY
+```
+[提示词优化器] → [Image-2 生图] → [Save Image]
 ```
 
-## 示例工作流
+1. 提示词优化器将"一只戴帽子的猫"转为结构化提示词
+2. Image-2 节点用优化后的提示词生成图片
 
-打开 `example_workflow.json`。
+### 图生图 + 参考图
 
-里面包含：
+```
+[Load Image] → [提示词优化器] → [通用生图] → [Save Image]
+                     ↑ 参考图输入
+```
 
-- 一个 `gpt-image-2-all` 示例，默认使用推荐的 chat/completions 端点。
-- 一个 `gpt-image-2-vip` 示例，使用 `image_size=2K Recommended` + `aspect_ratio=16:9`，发送 `size=2048x1152`。
-- 一个 `gpt-image-2` 示例，使用真实 `size=2048x1152`、`quality=high`、`output_format=jpeg`。
-- 中文 Note 节点，说明三个模型怎么选、比例前置写法、VIP 30 档 size、真实尺寸控制和图片编辑/mask 用法。
+参考图传入优化器，LLM 分析图片风格后生成匹配的提示词，再送入生图节点。
 
-分享工作流前请清空 API Key。
+### 视频生成
 
-## 常见问题
+```
+[提示词优化器] → [视频生成] → [Save Video]
+```
 
-### gpt-image-2-all 能不能硬控 2K / 4K？
+### 带人工审核
 
-不能。`gpt-image-2-all` 没有 `size` 参数，2K / 4K 只能作为 prompt 描述，无法保证输出像素。节点只做前置比例提示，不额外添加噪音尺寸描述。
+```
+[提示词优化器] → [文本停留编辑器] → [通用生图] → [Save Image]
+                       ↑ 人工修改提示词
+```
 
-### gpt-image-2-vip 怎么用？
+## 🌐 API 端点
 
-添加 `Comfyui-ZhangyuAPI-image-2-vip` 节点，再选 `image_size` 和 `aspect_ratio`。例如 `2K Recommended + 16:9` 会发送 `size=2048x1152`；`4K Detail + 16:9` 会发送 `size=3840x2160`。
+所有节点使用以下端点（`{api_base}` 默认 `https://zhangyuapi.com/v1`）：
 
-### 哪个节点能真实控制分辨率？
+| 端点 | 方法 | 用途 |
+|------|------|------|
+| `/v1/models` | GET | 获取可用模型列表 |
+| `/v1/images/generations` | POST | 文生图 |
+| `/v1/images/edits` | POST | 图生图 / 重绘 |
+| `/v1/videos` | POST | 视频生成 |
+| `/v1/tasks/{id}` | GET | 查询任务状态 |
+| `/v1/videos/{id}/content` | GET | 下载视频 |
+| `/v1/chat/completions` | POST | 提示词优化（LLM） |
 
-如果需要 30 档常见尺寸并想固定 ¥0.03/张，用 `Comfyui-ZhangyuAPI-image-2-vip`。如果需要任意合法自定义尺寸、`quality`、输出格式控制或 mask 局部重绘，用 `Comfyui-ZhangyuAPI-image-2`。例如 `image_size=2K` + `aspect_ratio=4:3` 会真正向 API 传 `size=2048x1536`。
+鉴权格式：`Authorization: Bearer YOUR_API_KEY`
 
-### 三个节点的端点有什么区别？
+## 🧩 架构
 
-- `Comfyui-ZhangyuAPI all` 和 `Comfyui-ZhangyuAPI-image-2-vip` 有 `endpoint (端点)` 切换：`chat_completions (推荐)` 走 `/v1/chat/completions` 从对话回复中提取图片，`images_api (兼容)` 走 `/v1/images/generations` 或 `/v1/images/edits`。
-- `Comfyui-ZhangyuAPI-image-2` 没有端点切换，始终使用 Images API。
+```
+用户输入 → INPUT_TYPES 校验 → generate()
+                │
+                ├─ 提示词优化 → POST /v1/chat/completions → 流式/非流式
+                │
+                ├─ 文生图 → POST /v1/images/generations
+                ├─ 图生图 → POST /v1/images/edits
+                ├─ 视频   → POST /v1/videos
+                │
+                ├─ 同步响应 → 解码图片/视频 → 返回
+                └─ 异步响应 → 自适应轮询(1s→3s→8s→15s) → 返回
+                              │
+                              └─ 前端进度条实时更新
+```
 
-### 加载旧工作流报 `Value 3 smaller than min of 30`？
+## 🔧 常见问题
 
-这是旧工作流 widget 顺序不匹配导致的：`retry_times=3` 被错读成了 `timeout_seconds=3`。请使用当前 `example_workflow.json`，或重新添加节点。
+**旧工作流报错** — 重新添加节点或使用最新 `example_workflow.json`。
 
-### 接入 `文本停留编辑器` 后，`gpt-image-2` 报 `Value not in list`？
+**模型列表为空** — 检查 API Key 是否正确，接口域名是否可达。
 
-这是把 `prompt` 转成输入口后，旧 workflow 少了一个 prompt 占位，导致后面的控件整体前移：例如 `mode` 被读成 `gpt-image-2`、`api_base` 被读成 `2K`、`image_size` 被读成 `16:9`。当前节点会在校验阶段放行，并在运行时自动把这些错位参数恢复；新 `example_workflow.json` 也已经补好占位。若界面上仍显示错位，重载当前工作流或重新添加 `Comfyui-ZhangyuAPI-image-2` 节点即可。
+**408 / 429 / 5xx 错误** — 节点会自动重试（`retry_times` 次），无需手动干预。
+
+**新模型不在下拉列表中** — 在 `custom_model (自定义模型名)` 字段直接填写模型名即可，无需修改代码。
+
+
+## 📄 许可证
+
+MIT
+
+## 📬 联系
+
+如有问题或建议，欢迎提交 Issue。

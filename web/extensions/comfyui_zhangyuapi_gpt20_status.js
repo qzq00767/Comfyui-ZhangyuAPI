@@ -3,11 +3,11 @@ import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "comfyui_zhangyuapi.runtime_status";
 const TARGET_NODE_TYPES = new Set([
-    "ComfyuiZhangyuAPINode",
-    "ComfyuiZhangyuAPIImage2VipNode",
     "ComfyuiZhangyuAPIImage2Node",
-    "ZhangyuAPIReferenceImagePromptOptimizer",
-    "ZhangyuAPIImage2PromptOptimizer",
+    "ComfyuiZhangyuAPIUniversalImageNode",
+    "ZhangyuAPIPromptOptimizer",
+    "ZhangyuAPITextListEditor",
+    "ComfyuiZhangyuAPIVideoNode",
 ]);
 const STATUS_EVENT = "comfyui_zhangyuapi_status";
 
@@ -237,6 +237,23 @@ function ensureStatusWidget(node) {
     return node.__lnbRuntimeStatusWidget;
 }
 
+function applyProgressCurve(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 0.99;
+
+    // Aggressive early curve — the bar races to ~90% quickly, then crawls.
+    // Typical tasks finish in 3-10s but timeout is 60-300s; without this
+    // the bar would sit at 10-30% when the task actually completes.
+    //   Phase 1 (0..5% time):   0→50%   — instant launch
+    //   Phase 2 (5..12% time):  50→80%  — fast push
+    //   Phase 3 (12..20% time): 80→90%  — gentle bend
+    //   Phase 4 (20..100% time): 90→99% — slow crawl, never hits 100%
+    if (t < 0.05) return (t / 0.05) * 0.50;
+    if (t < 0.12) return 0.50 + ((t - 0.05) / 0.07) * 0.30;
+    if (t < 0.20) return 0.80 + ((t - 0.12) / 0.08) * 0.10;
+    return 0.90 + ((t - 0.20) / 0.80) * 0.09;
+}
+
 function computeProgress(state) {
     const status = state?.status || "idle";
     if (status === "success") {
@@ -259,14 +276,17 @@ function computeProgress(state) {
     let inAttempt = 0;
     const timeoutSeconds = Number.isFinite(state?.timeoutSeconds) ? state.timeoutSeconds : 0;
     if (timeoutSeconds > 0 && Number.isFinite(state?.attemptElapsedSeconds)) {
-        inAttempt = clamp(state.attemptElapsedSeconds / timeoutSeconds, 0, 0.96);
+        const t = clamp(state.attemptElapsedSeconds / timeoutSeconds, 0, 1);
+        inAttempt = applyProgressCurve(t);
     } else {
         const pulse = (Date.now() % 1200) / 1200;
-        inAttempt = 0.08 + pulse * 0.82;
+        inAttempt = 0.08 + applyProgressCurve(pulse) * 0.91;
     }
 
     const raw = (completed + inAttempt) / retries;
-    return clamp(raw, 0.01, 0.99);
+    // Subtle live wobble — makes the bar feel alive even during slow crawl
+    const wobble = status === "running" ? Math.abs(Math.sin(Date.now() / 300)) * 0.002 : 0;
+    return clamp(raw + wobble, 0.01, 0.99);
 }
 
 function renderNodeState(node, state) {
@@ -438,6 +458,17 @@ app.registerExtension({
             ensureStatusWidget(this);
             return result;
         };
+
+        // Clean up state when a node is removed
+        const onRemoved = nodeType.prototype.onRemoved;
+        nodeType.prototype.onRemoved = function () {
+            if (this.id != null) {
+                runtimeStateByNodeId.delete(this.id);
+            }
+            if (onRemoved) {
+                return onRemoved.apply(this, arguments);
+            }
+        };
     },
     setup() {
         api.addEventListener(STATUS_EVENT, (event) => {
@@ -457,6 +488,11 @@ app.registerExtension({
             }
 
             const prev = runtimeStateByNodeId.get(nodeId);
+            // Guard: never downgrade a node that already succeeded.
+            // execution_error may fire after a delayed success emission.
+            if (prev && prev.status === "success") {
+                return;
+            }
             setStateFromStatusEvent({
                 node_id: nodeId,
                 status: "error",

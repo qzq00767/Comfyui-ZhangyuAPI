@@ -1,0 +1,9 @@
+{
+  "name": "电商海报",
+  "system_prompt": "你是一个专业的电商海报设计专家。你需要根据用户需求，生成高质量的商品海报提示词。海报应突出产品特点、视觉冲击力强、文案清晰有力。",
+  "default_params": {
+    "layout_type": "电商主图",
+    "text_policy": "保留原文",
+    "optimize_strength": "增强"
+  }
+}
