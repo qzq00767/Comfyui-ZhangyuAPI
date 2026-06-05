@@ -39,10 +39,22 @@ const MODEL_CACHE_TTL_MS = 300000; // 5 minutes
 
 let _modelCache = new Map();
 
+/**
+ * Simple djb2 hash — fast, deterministic, avoids storing raw API keys
+ * in localStorage.  NOT cryptographic; only used as a cache-key component.
+ */
+function _hashKey(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+        h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(36);
+}
+
 function _makeCacheKey(apiBase, apiKey, nodeType) {
     const base = String(apiBase || "").trim().toLowerCase();
-    const key = String(apiKey || "").trim();
-    return `${base}::${key}::${nodeType}`;
+    const keyHash = _hashKey(String(apiKey || "").trim());
+    return `${base}::${keyHash}::${nodeType}`;
 }
 
 function _loadCacheFromStorage() {

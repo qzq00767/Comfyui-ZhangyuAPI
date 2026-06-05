@@ -69,12 +69,14 @@ from .zhangyu_gpt_img2 import (  # noqa: E402
     _download_images_async,
     _sanitize_api_response,
     _strip_image_data,
+    _extract_api_error_message,
     # input sanitization
     safe_choice,
     safe_int,
     safe_float,
     normalize_prompt_text,
     normalize_api_base,
+    denormalize_api_base,
     # model discovery & filtering
     fetch_available_models,
     _filter_image_models,
@@ -82,6 +84,7 @@ from .zhangyu_gpt_img2 import (  # noqa: E402
     resolve_and_validate_model,
     # frontend status
     emit_runtime_status,
+    _log,
 )
 
 
@@ -215,7 +218,7 @@ class ComfyuiZhangyuAPIUniversalImageNode:
                                "placeholder": "手动填写模型名，留空则自动从接口获取"}),
                 "custom_model (自定义模型名)": (
                     "STRING", {"default": "", "multiline": False}),
-                "n (生成数量)": (
+                "n (生成数量-谨慎使用)": (
                     "INT", {"default": 1, "min": 1, "max": 10}),
                 "size (尺寸)": (
                     cls.SIZES, {"default": "auto (自动)"}),
@@ -559,36 +562,6 @@ class ComfyuiZhangyuAPIUniversalImageNode:
         )
 
     # ------------------------------------------------------------------
-    # Error parsing (OpenAI-compatible error format)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_error_message(data):
-        """Extract a human-readable error string from an API error response.
-
-        Standard error format::
-
-            {"error": {"message": "...", "type": "...", "code": "..."}}
-
-        Falls back to the raw response text on parse failure.
-
-        Args:
-            data: Parsed JSON dict from an error response.
-
-        Returns:
-            ``str`` — error message.
-
-        """
-        if not isinstance(data, dict):
-            return str(data)[:500]
-        error = data.get("error")
-        if isinstance(error, dict):
-            return error.get("message") or json.dumps(error, ensure_ascii=False)
-        if isinstance(error, str):
-            return error
-        return json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]
-
-    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -626,8 +599,9 @@ class ComfyuiZhangyuAPIUniversalImageNode:
         custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
         if custom_model:
             model = custom_model
+            _log("info", f"[用户自定义模型] {model}")
 
-        n_images = safe_int(kwargs.get("n (生成数量)", 1), 1, 1, 10)
+        n_images = safe_int(kwargs.get("n (生成数量-谨慎使用)", 1), 1, 1, 10)
         size = self._parse_size_preset(
             kwargs.get("size (尺寸)", "auto (自动)"))
         negative_prompt = kwargs.get("negative_prompt (反向提示词)", "")
@@ -762,7 +736,7 @@ class ComfyuiZhangyuAPIUniversalImageNode:
                 if response.status_code != 200:
                     try:
                         err_data = response.json()
-                        err_msg = self._extract_error_message(err_data)
+                        err_msg = _extract_api_error_message(err_data)
                     except Exception:
                         err_msg = response.text[:500]
                     last_error = f"API 错误 {response.status_code}: {err_msg}"
@@ -813,7 +787,7 @@ class ComfyuiZhangyuAPIUniversalImageNode:
 
                 response_info = {
                     "status": "success",
-                    "api_base": api_base,
+                    "api_base": denormalize_api_base(api_base),
                     "model": model,
                     "model_type": model_type,
                     "n": n_images,

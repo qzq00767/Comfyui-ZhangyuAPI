@@ -17,6 +17,7 @@ Features:
 import asyncio
 import base64
 import json
+import hashlib
 import os
 import re
 import random
@@ -34,15 +35,15 @@ import torch
 # ---------------------------------------------------------------------------
 # Global defaults — every timeout reference in the file uses these constants
 # ---------------------------------------------------------------------------
-DEFAULT_API_BASE_URL = "https://zhangyuapi.com/v1"
+DEFAULT_API_BASE_URL = base64.b64decode("aHR0cHM6Ly96aGFuZ3l1YXBpLmNvbS92MQ==").decode()
 API_BASE_URLS = [
-    DEFAULT_API_BASE_URL,  # display only — internally rewrites to svip (direct)
+    DEFAULT_API_BASE_URL,  # display only — internally rewrites to direct backend
 ]
 
 # Public-facing → direct-backend domain rewrite.
 # The dropdown shows the public URL; actual requests go to the hidden direct server.
 _API_BASE_REWRITE = {
-    "https://zhangyuapi.com": "https://svip.zhangyuapi.com",
+    base64.b64decode("aHR0cHM6Ly96aGFuZ3l1YXBpLmNvbQ==").decode(): base64.b64decode("aHR0cHM6Ly9zdmlwLnpoYW5neXVhcGkuY29t").decode(),
 }
 
 # HTTP client timeouts (seconds)
@@ -81,6 +82,32 @@ _RETRYABLE_EXCEPTIONS = (
     httpx.ReadTimeout,
     httpx.RemoteProtocolError,
 )
+
+# ---------------------------------------------------------------------------
+# Centralized logging — timestamped, level-filtered, safe for multi-thread
+# ---------------------------------------------------------------------------
+
+_LOG_LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+_LOG_MIN_LEVEL = "info"  # change to "debug" for verbose output
+_LOG_MAX_LENGTH = 2000   # truncate overly long messages to avoid log flooding
+
+
+def _log(level, *args):
+    """Centralised logging with timestamp and level tag.
+
+    Args:
+        level: One of ``"debug"``, ``"info"``, ``"warn"``, ``"error"``.
+        *args: Values to print (joined with spaces).
+    """
+    if _LOG_LEVELS.get(level, 99) < _LOG_LEVELS.get(_LOG_MIN_LEVEL, 1):
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    tag = level.upper().ljust(5)
+    msg = " ".join(str(a) for a in args)
+    if len(msg) > _LOG_MAX_LENGTH:
+        msg = msg[:_LOG_MAX_LENGTH] + f"…<truncated {len(msg) - _LOG_MAX_LENGTH} chars>"
+    print(f"[{ts}] [{tag}] {msg}")
+
 
 # ---------------------------------------------------------------------------
 # Per-thread HTTP client — httpx.Client is NOT thread-safe (unlike the old
@@ -563,6 +590,60 @@ def is_retryable_http_status(status_code):
     return status_code in (408, 429) or status_code >= 500
 
 
+def _download_bytes_with_retry(url, headers, timeout_seconds,
+                               retry_times=DEFAULT_RETRY_TIMES,
+                               label="下载"):
+    """Download raw bytes from *url* with jittered-backoff retry.
+
+    Shared by both image and video download paths to avoid retry-logic
+    duplication.
+
+    Args:
+        url: Full download URL.
+        headers: Request headers dict.
+        timeout_seconds: Read timeout per attempt.
+        retry_times: Maximum download attempts.
+        label: Human-readable context for error messages (e.g. ``"视频"``).
+
+    Returns:
+        ``bytes``.
+
+    Raises:
+        RuntimeError: On failure after all retries.
+
+    """
+    last_error = None
+    for attempt in range(1, retry_times + 1):
+        try:
+            response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
+            if not response.is_success:
+                raise httpx.HTTPStatusError(
+                    f"HTTP {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            return response.content
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_error = str(exc)
+            if attempt < retry_times:
+                time.sleep(_jittered_backoff_seconds(attempt))
+                continue
+            break
+        except httpx.HTTPStatusError as exc:
+            if is_retryable_http_status(exc.response.status_code):
+                last_error = str(exc)
+                if attempt < retry_times:
+                    time.sleep(_jittered_backoff_seconds(attempt))
+                    continue
+            raise RuntimeError(
+                f"{label}下载失败 (url={url[:200]}): {exc}"
+            ) from exc
+    raise RuntimeError(
+        f"{label}下载连续 {retry_times} 次失败 "
+        f"(url={url[:200]}): {last_error}"
+    )
+
+
 # ===================================================================
 # Adaptive async-task polling
 # ===================================================================
@@ -613,21 +694,27 @@ def _poll_async_task(
     timeout_seconds,
     retry_times=DEFAULT_RETRY_TIMES,
     on_tick=None,
+    poll_url=None,
 ):
     """Poll an async API task with adaptive intervals until completion.
 
-    This is the **single entry point** for all task polling.  When *on_tick*
-    is provided it is called before each sleep so callers can push progress
-    updates (e.g. to the ComfyUI frontend).
+    This is the **single entry point** for all task polling — used by both
+    image nodes (``/v1/tasks/{id}``) and video nodes (``/v1/videos/{id}``).
+
+    When *on_tick* is provided it is called before each sleep so callers can
+    push progress updates (e.g. to the ComfyUI frontend).
 
     Args:
         api_base: Normalized API base URL.
         headers: Request headers dict (must include ``Authorization``).
-        task_id: The task ID returned by the async submission.
+        task_id: The task / video ID returned by the async submission.
         timeout_seconds: Maximum total time to poll before raising.
         retry_times: Maximum consecutive error count before aborting.
         on_tick: Optional callback ``(elapsed, poll_elapsed, interval)``
             invoked before each adaptive sleep.
+        poll_url: Override the polling URL.  When ``None`` (default), the
+            standard ``{api_base}/v1/tasks/{task_id}`` is used.  Video nodes
+            pass ``{api_base}/v1/videos/{task_id}`` instead.
 
     Returns:
         ``dict`` — the completed task data (same shape as a sync API response).
@@ -638,7 +725,7 @@ def _poll_async_task(
     """
     start_ts = time.time()       # total wall-clock from generate() entry
     poll_start = time.time()     # wall-clock since polling began
-    url = f"{api_base}/v1/tasks/{task_id}"
+    url = poll_url or f"{api_base}/v1/tasks/{task_id}"
     consecutive_errors = 0
     max_consecutive_errors = retry_times
 
@@ -781,6 +868,16 @@ def normalize_api_base(api_base):
 
     """
     base = (api_base or DEFAULT_API_BASE_URL).strip().rstrip("/")
+    # Validate URL scheme — only https/http are allowed
+    if "://" in base:
+        scheme = base.split("://")[0].lower()
+        if scheme not in ("https", "http"):
+            raise ValueError(
+                f"不支持的接口协议 '{scheme}://'，"
+                f"请使用 https:// 或 http://"
+            )
+    elif not base.startswith("http"):
+        base = "https://" + base
     # Rewrite public-facing domains to direct backend.
     # Require a trailing "/" or end-of-string after the domain to avoid
     # prefix-confusion with lookalike domains (e.g. zhangyuapi.com.evil.com).
@@ -790,6 +887,26 @@ def normalize_api_base(api_base):
             break
     if base.endswith("/v1"):
         base = base[:-3]
+    return base
+
+
+def denormalize_api_base(api_base):
+    """Reverse :func:`normalize_api_base` for safe logging/display.
+
+    Maps the internal backend domain back to the public-facing domain
+    so that logs and debug output never reveal the hidden direct server.
+
+    Args:
+        api_base: Normalized API base URL (output of :func:`normalize_api_base`).
+
+    Returns:
+        ``str`` — public-facing base URL suitable for display/logging.
+    """
+    base = (api_base or "").strip().rstrip("/")
+    for display_domain, actual_domain in _API_BASE_REWRITE.items():
+        if base == actual_domain or base.startswith(actual_domain + "/"):
+            base = display_domain + base[len(actual_domain):]
+            break
     return base
 
 
@@ -954,6 +1071,33 @@ def _strip_image_data(obj, max_preview=60):
     if isinstance(obj, list):
         return [_strip_image_data(item, max_preview) for item in obj]
     return obj
+
+
+def _extract_api_error_message(data):
+    """Extract a human-readable error string from an API error response.
+
+    Handles OpenAI-compatible error format::
+
+        {"error": {"message": "...", "type": "...", "code": "..."}}
+
+    Falls back to the raw response text on parse failure.  Shared by all
+    nodes that parse API error responses.
+
+    Args:
+        data: Parsed JSON dict from an error response (or a raw string).
+
+    Returns:
+        ``str`` — error message (truncated to 500 chars).
+
+    """
+    if not isinstance(data, dict):
+        return str(data)[:500]
+    error = data.get("error")
+    if isinstance(error, dict):
+        return error.get("message") or json.dumps(error, ensure_ascii=False)
+    if isinstance(error, str):
+        return error
+    return json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]
 
 
 def _parse_response_images(data, timeout_seconds, error_prefix="API"):
@@ -1163,7 +1307,7 @@ class ComfyuiZhangyuAPIImage2Node:
                     cls.MODELS, {"default": "gpt-image-2"}),
                 "custom_model (自定义模型名)": (
                     "STRING", {"default": "", "multiline": False}),
-                "n (生成数量)": (
+                "n (生成数量-谨慎使用)": (
                     "INT", {"default": 1, "min": 1, "max": 5}),
                 "api_base (接口域名)": (
                     "STRING", {"default": DEFAULT_API_BASE_URL, "multiline": False}),
@@ -1381,7 +1525,8 @@ class ComfyuiZhangyuAPIImage2Node:
         custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
         if custom_model:
             model = custom_model
-        n_images = safe_int(kwargs.get("n (生成数量)", 1), 1, 1, 5)
+            _log("info", f"[用户自定义模型] {model}")
+        n_images = safe_int(kwargs.get("n (生成数量-谨慎使用)", 1), 1, 1, 5)
         api_base = normalize_api_base(
                 kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL)
             )
@@ -1453,7 +1598,7 @@ class ComfyuiZhangyuAPIImage2Node:
         print(
             f"[Comfyui-ZhangyuAPI-image-2] mode={actual_mode}, "
             f"image_size={image_size}, aspect_ratio={aspect_ratio}, "
-            f"fields={fields}, seed={seed} (not sent to API)"
+            f"fields={_strip_image_data(fields)}, seed={seed} (not sent to API)"
         )
         emit_runtime_status(unique_id, "running", "开始生成",
                             0.0, 0, retry_times, timeout_seconds)
@@ -1495,7 +1640,7 @@ class ComfyuiZhangyuAPIImage2Node:
 
                 if response.status_code != 200:
                     last_error = (
-                        f"API 错误 {response.status_code}: {response.text}"
+                        f"API 错误 {response.status_code}: {response.text[:500]}"
                     )
                     if (is_retryable_http_status(response.status_code)
                             and attempt < retry_times):
@@ -1547,7 +1692,7 @@ class ComfyuiZhangyuAPIImage2Node:
                     "status": "success",
                     "model": model,
                     "mode": actual_mode,
-                    "api_base": api_base,
+                    "api_base": denormalize_api_base(api_base),
                     "image_size": image_size,
                     "aspect_ratio": aspect_ratio,
                     "resolved_size": effective_size,
@@ -1641,34 +1786,48 @@ _IMAGE_MODEL_EXCLUDE_PATTERNS = [
 ]
 
 
-def _filter_chat_models(all_models):
-    """Remove known image/video-only models from a model list.
+def _filter_models_by_patterns(all_models, patterns, mode="exclude",
+                               fallback_empty=True):
+    """Generic model-list filter shared by all nodes.
 
-    Returns models that are likely to support ``POST /v1/chat/completions``.
-    Returns an empty list if no chat-capable models are found (caller should
-    handle this gracefully rather than falling back to unfiltered models).
+    Args:
+        all_models: ``list[str]`` — full model list from the API.
+        patterns: ``list[str]`` — substrings to match (lowercased).
+        mode: ``"exclude"`` to keep models NOT matching any pattern;
+            ``"include"`` to keep only models that DO match.
+        fallback_empty: If ``True`` and the result is empty, return the
+            original list instead (lenient filtering).
+
+    Returns:
+        ``list[str]``.
     """
     if not all_models:
         return []
-    return [
-        m for m in all_models
-        if not any(p in m.lower() for p in _CHAT_MODEL_EXCLUDE_PATTERNS)
-    ]
+    if not patterns:
+        return list(all_models)
+
+    if mode == "include":
+        result = [m for m in all_models
+                  if any(p in m.lower() for p in patterns)]
+    else:
+        result = [m for m in all_models
+                  if not any(p in m.lower() for p in patterns)]
+
+    if fallback_empty and not result:
+        return list(all_models)
+    return result
+
+
+def _filter_chat_models(all_models):
+    """Thin wrapper — exclude known image/video-only models."""
+    return _filter_models_by_patterns(all_models, _CHAT_MODEL_EXCLUDE_PATTERNS,
+                                       mode="exclude", fallback_empty=False)
 
 
 def _filter_image_models(all_models):
-    """Remove known chat / video / TTS / embedding models from a model list.
-
-    Returns models that are likely to support ``POST /v1/images/generations``.
-    Returns an empty list if no image-capable models are found (caller should
-    handle this gracefully rather than falling back to unfiltered models).
-    """
-    if not all_models:
-        return []
-    return [
-        m for m in all_models
-        if not any(p in m.lower() for p in _IMAGE_MODEL_EXCLUDE_PATTERNS)
-    ]
+    """Thin wrapper — exclude known chat/video/tts/embedding models."""
+    return _filter_models_by_patterns(all_models, _IMAGE_MODEL_EXCLUDE_PATTERNS,
+                                       mode="exclude", fallback_empty=False)
 
 # ===================================================================
 # TTL-cached model-list fetching
@@ -1680,9 +1839,9 @@ DEFAULT_MODEL_CACHE_TTL = 300  # seconds
 
 
 def _make_cache_key(api_base, api_key):
-    """Build a cache key from credentials."""
-    return (normalize_api_base(api_base or DEFAULT_API_BASE_URL),
-            (api_key or "").strip())
+    """Build a cache key from credentials (API key is hashed)."""
+    key_hash = hashlib.sha256((api_key or "").strip().encode()).hexdigest()
+    return (normalize_api_base(api_base or DEFAULT_API_BASE_URL), key_hash)
 
 
 def fetch_available_models_cached(api_base, api_key, ttl=None,

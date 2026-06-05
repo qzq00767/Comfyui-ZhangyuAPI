@@ -32,12 +32,14 @@ from .zhangyu_gpt_img2 import (
     _jittered_sleep,
     is_retryable_http_status,
     normalize_api_base,
+    denormalize_api_base,
     tensor_to_data_url,
     emit_runtime_status,
     DEFAULT_API_BASE_URL,
     # Model resolution & validation
     resolve_and_validate_model,
     _filter_chat_models,
+    _log,
 )
 
 
@@ -802,7 +804,7 @@ class ZhangyuAPIPromptOptimizer:
         direction = _ratio_to_direction(aspect_ratio)
         debug_info = (
             f"model={model}\n"
-            f"api_base={api_base}\n"
+            f"api_base={denormalize_api_base(api_base)}\n"
             f"layout_type={layout_type}\n"
             f"optimize_strength={optimize_strength}\n"
             f"aspect_ratio={aspect_ratio}\n"
@@ -846,6 +848,7 @@ class ZhangyuAPIPromptOptimizer:
         custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
         if custom_model:
             model = custom_model
+            _log("info", f"[用户自定义模型] {model}")
         timeout_seconds = kwargs.get("timeout_seconds (超时秒数)", 600)
         stream = kwargs.get("stream (流式输出)", False)
         temperature = float(kwargs.get("temperature (创造性)", 0.7))

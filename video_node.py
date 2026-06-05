@@ -35,19 +35,20 @@ from .zhangyu_gpt_img2 import (  # noqa: E402
     ZHANGYUAPI_timeout,
     # URL / prompt sanitizers
     normalize_api_base,
+    denormalize_api_base,
     normalize_prompt_text,
     # Input coercers
     safe_choice,
     safe_int,
     # Async detection
     is_async_task_response,
-    # Polling stages (reuse adaptive interval)
-    _adaptive_poll_interval,
+    # Polling (reuse unified _poll_async_task from shared module)
+    _poll_async_task,
     # Retry / backoff
     is_retryable_http_status,
-    _jittered_backoff_seconds,
     _jittered_sleep,
     _RETRYABLE_EXCEPTIONS,
+    _download_bytes_with_retry,
     # Frontend status emitter
     emit_runtime_status,
     # Constants
@@ -61,6 +62,10 @@ from .zhangyu_gpt_img2 import (  # noqa: E402
     resolve_and_validate_model,
     # Response sanitizer (strips base64 from API responses)
     _sanitize_api_response,
+    _extract_api_error_message,
+    # Unified model filtering
+    _filter_models_by_patterns,
+    _log,
 )
 
 # ---------------------------------------------------------------------------
@@ -110,16 +115,14 @@ _VIDEO_MODEL_PATTERNS = [
 def _filter_video_models(all_models):
     """Filter a list of model IDs to only video-capable models.
 
-    Uses known video model name patterns.  Falls back to returning all
-    models if no matches are found (the API may use an unknown prefix).
+    Uses known video model name patterns (include mode).  Falls back to
+    returning all models if no matches are found (the API may use an
+    unknown prefix).
     """
-    if not all_models:
-        return []
-    video_models = [
-        m for m in all_models
-        if any(pattern in m.lower() for pattern in _VIDEO_MODEL_PATTERNS)
-    ]
-    return video_models if video_models else all_models
+    return _filter_models_by_patterns(
+        all_models, _VIDEO_MODEL_PATTERNS,
+        mode="include", fallback_empty=True,
+    )
 
 
 # Register backend route for video-model fetching
@@ -182,98 +185,6 @@ except Exception as _exc:
     print(f"Warning: Could not register video-model-fetch route: {_exc}")
 
 
-# ===================================================================
-# Video polling (reuses adaptive interval from zhangyu_gpt_img2)
-# ===================================================================
-
-def _poll_video_task(api_base, headers, video_id, timeout_seconds,
-                     retry_times=DEFAULT_VIDEO_RETRY_TIMES, on_tick=None):
-    """Poll a video generation task with adaptive intervals.
-
-    Polls ``GET {api_base}/v1/videos/{video_id}`` until completion,
-    failure, or timeout.  Uses the same adaptive stage strategy as
-    ``_poll_async_task`` (reuses ``_adaptive_poll_interval``).
-
-    Args:
-        api_base: Normalized API base URL.
-        headers: Request headers dict (must include ``Authorization``).
-        video_id: The video / task ID from the async submission.
-        timeout_seconds: Maximum total poll time.
-        retry_times: Max consecutive errors before aborting.
-        on_tick: Optional ``(elapsed, poll_elapsed, interval)`` callback.
-
-    Returns:
-        ``dict`` — the completed task data.
-
-    Raises:
-        RuntimeError: On timeout, task failure, or excessive errors.
-    """
-    start_ts = time.time()
-    poll_start = time.time()
-    url = f"{api_base}/v1/videos/{video_id}"
-    consecutive_errors = 0
-    max_consecutive_errors = retry_times
-
-    while True:
-        elapsed = time.time() - start_ts
-        poll_elapsed = time.time() - poll_start
-        remaining = timeout_seconds - int(poll_elapsed + 0.999)
-
-        if remaining <= 0:
-            raise RuntimeError(
-                f"视频任务轮询超时 ({timeout_seconds}s)，"
-                f"已等待 {elapsed:.1f}s"
-            )
-
-        try:
-            response = ZHANGYUAPI_get(url, remaining, headers=headers)
-
-            if response.status_code == 200:
-                consecutive_errors = 0
-                data = response.json()
-                status = str(data.get("status", "")).lower()
-
-                if status in ("completed", "succeeded", "success", "done"):
-                    return data
-                if status in ("failed", "error", "cancelled", "canceled"):
-                    error_msg = (
-                        data.get("error")
-                        or data.get("message")
-                        or status
-                    )
-                    raise RuntimeError(
-                        f"视频任务失败 (id={video_id}): {error_msg}"
-                    )
-
-            elif is_retryable_http_status(response.status_code):
-                consecutive_errors += 1
-                if consecutive_errors > max_consecutive_errors:
-                    raise RuntimeError(
-                        f"轮询连续 {consecutive_errors} 次 HTTP "
-                        f"{response.status_code} 错误，中止"
-                    )
-            else:
-                raise RuntimeError(
-                    f"轮询失败 HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-
-        except _RETRYABLE_EXCEPTIONS as exc:
-            consecutive_errors += 1
-            if consecutive_errors > max_consecutive_errors:
-                raise RuntimeError(
-                    f"轮询连续 {consecutive_errors} 次网络错误，中止: {exc}"
-                )
-
-        # Wait before next poll — use jittered backoff after errors,
-        # adaptive interval otherwise
-        if consecutive_errors > 0:
-            time.sleep(_jittered_backoff_seconds(consecutive_errors))
-        else:
-            interval = _adaptive_poll_interval(poll_elapsed)
-            if on_tick is not None:
-                on_tick(elapsed, poll_elapsed, interval)
-            time.sleep(interval)
 
 
 # ===================================================================
@@ -423,94 +334,21 @@ class ComfyuiZhangyuAPIVideoNode:
                                  timeout_seconds, retry_times=3):
         """Download video bytes from ``GET /v1/videos/{id}/content``.
 
-        Retries on transient errors with jittered backoff.
-
-        Args:
-            api_base: Normalized API base URL.
-            headers: Request headers (must include ``Authorization``).
-            video_id: Video / task ID.
-            timeout_seconds: Read timeout.
-            retry_times: Max download attempts.
-
-        Returns:
-            ``bytes`` — the raw mp4 content.
-
-        Raises:
-            RuntimeError: On download failure after all retries.
+        Delegates to shared :func:`_download_bytes_with_retry`.
         """
         url = f"{api_base}/v1/videos/{video_id}/content"
-        last_error = None
-
-        for attempt in range(1, retry_times + 1):
-            try:
-                response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
-                if not response.is_success:
-                    raise httpx.HTTPStatusError(
-                        f"HTTP {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                return response.content
-            except _RETRYABLE_EXCEPTIONS as exc:
-                last_error = str(exc)
-                if attempt < retry_times:
-                    time.sleep(_jittered_backoff_seconds(attempt))
-                    continue
-                break
-            except httpx.HTTPStatusError as exc:
-                if is_retryable_http_status(exc.response.status_code):
-                    last_error = str(exc)
-                    if attempt < retry_times:
-                        time.sleep(_jittered_backoff_seconds(attempt))
-                        continue
-                raise RuntimeError(
-                    f"视频下载失败 (id={video_id}): {exc}"
-                ) from exc
-
-        raise RuntimeError(
-            f"视频下载连续 {retry_times} 次失败 "
-            f"(id={video_id}): {last_error}"
+        return _download_bytes_with_retry(
+            url, headers, timeout_seconds, retry_times, label="视频",
         )
 
     @staticmethod
-    def _download_video_from_url(video_url, timeout_seconds, retry_times=3):
+    def _download_video_from_url(video_url, headers, timeout_seconds, retry_times=3):
         """Download video bytes from a direct URL (xAI pattern).
 
-        Returns ``bytes``.
+        Delegates to shared :func:`_download_bytes_with_retry`.
         """
-        last_error = None
-
-        for attempt in range(1, retry_times + 1):
-            try:
-                response = ZHANGYUAPI_get(
-                    video_url, timeout_seconds, headers=headers,
-                )
-                if not response.is_success:
-                    raise httpx.HTTPStatusError(
-                        f"HTTP {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                return response.content
-            except _RETRYABLE_EXCEPTIONS as exc:
-                last_error = str(exc)
-                if attempt < retry_times:
-                    time.sleep(_jittered_backoff_seconds(attempt))
-                    continue
-                break
-            except httpx.HTTPStatusError as exc:
-                if is_retryable_http_status(exc.response.status_code):
-                    last_error = str(exc)
-                    if attempt < retry_times:
-                        time.sleep(_jittered_backoff_seconds(attempt))
-                        continue
-                raise RuntimeError(
-                    f"视频下载失败 (url={video_url[:200]}): {exc}"
-                ) from exc
-
-        raise RuntimeError(
-            f"视频下载连续 {retry_times} 次失败 "
-            f"(url={video_url[:200]}): {last_error}"
+        return _download_bytes_with_retry(
+            video_url, headers, timeout_seconds, retry_times, label="视频",
         )
 
     @staticmethod
@@ -537,22 +375,6 @@ class ComfyuiZhangyuAPIVideoNode:
             f.write(video_bytes)
         print(f"[Comfyui-ZhangyuAPI-视频] saved: {filepath}")
         return filepath
-
-    # ------------------------------------------------------------------
-    # Error parsing
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_error_message(data):
-        """Extract human-readable error from an API error response."""
-        if not isinstance(data, dict):
-            return str(data)[:500]
-        error = data.get("error")
-        if isinstance(error, dict):
-            return error.get("message") or json.dumps(error, ensure_ascii=False)
-        if isinstance(error, str):
-            return error
-        return json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -585,6 +407,7 @@ class ComfyuiZhangyuAPIVideoNode:
         custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
         if custom_model:
             model = custom_model
+            _log("info", f"[用户自定义模型] {model}")
 
         seconds = safe_int(kwargs.get("seconds (时长秒数)", 8), 8, 4, 60)
         size = safe_choice(
@@ -660,7 +483,7 @@ class ComfyuiZhangyuAPIVideoNode:
                 if response.status_code not in (200, 201, 202):
                     try:
                         err_data = response.json()
-                        err_msg = self._extract_error_message(err_data)
+                        err_msg = _extract_api_error_message(err_data)
                     except Exception:
                         err_msg = response.text[:500]
                     last_error = f"API 错误 {response.status_code}: {err_msg}"
@@ -695,7 +518,7 @@ class ComfyuiZhangyuAPIVideoNode:
                     )
                     if video_url:
                         video_bytes = self._download_video_from_url(
-                            video_url, timeout_seconds, retry_times,
+                            video_url, headers, timeout_seconds, retry_times,
                         )
                         filepath = self._save_video(video_bytes, "direct")
                         return self._build_return(
@@ -726,9 +549,10 @@ class ComfyuiZhangyuAPIVideoNode:
                         attempt, retry_times, timeout_seconds,
                     )
 
-                polled_data = _poll_video_task(
+                polled_data = _poll_async_task(
                     api_base, headers, video_id, remaining, retry_times,
                     on_tick=_on_poll_tick,
+                    poll_url=f"{api_base}/v1/videos/{video_id}",
                 )
 
                 # -- Download video --------------------------------------------
@@ -742,7 +566,7 @@ class ComfyuiZhangyuAPIVideoNode:
                 video_info = polled_data.get("video", {})
                 if isinstance(video_info, dict) and video_info.get("url"):
                     video_bytes = self._download_video_from_url(
-                        video_info["url"], timeout_seconds, retry_times,
+                        video_info["url"], headers, timeout_seconds, retry_times,
                     )
                 else:
                     # Pattern A (OpenAI): GET /v1/videos/{id}/content
@@ -803,7 +627,7 @@ class ComfyuiZhangyuAPIVideoNode:
 
         response_info = {
             "status": "success",
-            "api_base": api_base,
+            "api_base": denormalize_api_base(api_base),
             "model": model,
             "seconds": seconds,
             "size": size,
