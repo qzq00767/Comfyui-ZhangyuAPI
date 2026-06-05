@@ -7,7 +7,10 @@ const TARGET_NODE_TYPES = new Set([
     "ComfyuiZhangyuAPIUniversalImageNode",
     "ZhangyuAPIPromptOptimizer",
     "ZhangyuAPITextListEditor",
-    "ComfyuiZhangyuAPIVideoNode",
+    "ComfyuiZhangyuAPISoraNode",
+    "ComfyuiZhangyuAPIKlingNode",
+    "ComfyuiZhangyuAPIJimengNode",
+    "ComfyuiZhangyuAPIGeminiNode",
 ]);
 const STATUS_EVENT = "comfyui_zhangyuapi_status";
 

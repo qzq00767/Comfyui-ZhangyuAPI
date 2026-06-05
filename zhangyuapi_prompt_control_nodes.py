@@ -3,21 +3,18 @@
 """
 Comfyui-ZhangyuAPI — 提示词优化 + 文本停留编辑节点.
 
-合并了原来的「图生图提示词控制器」和「GPT-Image-2 文生图提示词控制器」
-为一个节点，根据是否连接参考图自动切换模式。支持流式 / 非流式对话生成。
+- 提示词反推：多模态 LLM 分析参考图 → 输出提示词
+- 提示词优化：两阶段 LLM（Schema 解析 → 提示词渲染）
+- 文本停留编辑器：暂停工作流让用户手动编辑文本
 
-文本能力核心：
-- Endpoint: ``POST /v1/chat/completions``
-- Auth: ``Authorization: Bearer <api_key>``
-- 非流式: ``{"stream": false}`` → ``choices[0].message.content``
-- 流式: ``{"stream": true}`` → SSE ``data: {...}`` 事件流
-
-模型列表由前端自动从 ``GET /v1/models`` 获取，无需硬编码。
+Endpoint: ``POST /v1/chat/completions``
+Auth: ``Authorization: Bearer <api_key>``
 """
 
 import hashlib
 import json
 import pathlib
+import random
 import re
 import time
 import uuid
@@ -49,17 +46,6 @@ from .zhangyu_gpt_img2 import (
 
 CATEGORY = "Comfyui-ZhangyuAPI/文本"
 
-# Aspect ratios — kept for prompt optimisation context
-ASPECT_RATIO_OPTIONS = [
-    "auto",
-    "1:1", "2:3", "3:2", "3:4", "4:5",
-    "9:16", "16:9", "21:9",
-]
-
-_LANDSCAPE = {"16:9", "3:2", "2:1", "21:9", "3:1", "4:1", "8:1"}
-_PORTRAIT = {"9:16", "2:3", "3:4", "1:2", "9:21", "1:3", "1:4", "1:8"}
-_SQUARE = {"1:1"}
-
 _REFERENCE_MODE_MAP = {
     "自动判断": "auto",
     "综合参考": "full_reference",
@@ -80,9 +66,9 @@ _STRENGTH_MAP = {"light": "标准", "standard": "标准", "strong": "增强"}
 
 # Map preset default_params keys → ComfyUI kwarg display names
 _PRESET_KEY_MAP = {
-    "layout_type": "layout_type (版式类型)",
-    "text_policy": "text_policy (文字策略)",
-    "optimize_strength": "optimize_strength (优化强度)",
+    "layout_type": "layout_type (画面版式)",
+    "text_policy": "text_policy (画面文字)",
+    "optimize_strength": "optimize_strength (强度)",
 }
 
 _BANNED_TEXT_PHRASES = [
@@ -193,8 +179,29 @@ def _extract_chat_content(data):
     return str(content or "")
 
 
+def _build_chat_payload(model, messages, stream, temperature, max_tokens,
+                         seed=0, enable_web_search=False, json_output=False):
+    """Build the JSON body for ``POST /v1/chat/completions``."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if seed:
+        payload["seed"] = seed
+    if enable_web_search:
+        payload["web_search_options"] = {"search_context_size": "medium"}
+    if json_output:
+        payload["response_format"] = {"type": "json_object"}
+    return payload
+
+
 def _call_chat_stream(api_base, api_key, model, messages,
-                      timeout_seconds=600, temperature=0.7, max_tokens=4096):
+                      timeout_seconds=600, temperature=0.7, max_tokens=4096,
+                      seed=0, enable_web_search=False,
+                      json_output=False):
     """Streaming call to ``POST /v1/chat/completions`` (SSE).
 
     Parses ``data: {...}`` lines, concatenates ``delta.content`` chunks,
@@ -214,13 +221,11 @@ def _call_chat_stream(api_base, api_key, model, messages,
         a synthetic response dict mimicking the non-streaming format.
     """
     url = _chat_url(api_base)
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    payload = _build_chat_payload(
+        model, messages, True, temperature, max_tokens,
+        seed=seed, enable_web_search=enable_web_search,
+        json_output=json_output,
+    )
     content_parts = []
     finish_reason = None
     model_used = model
@@ -274,20 +279,20 @@ def _call_chat_stream(api_base, api_key, model, messages,
 
 
 def _call_chat_nonstream(api_base, api_key, model, messages,
-                          timeout_seconds=600, temperature=0.7, max_tokens=4096):
+                          timeout_seconds=600, temperature=0.7, max_tokens=4096,
+                          seed=0, enable_web_search=False,
+                          json_output=False):
     """Non-streaming call to ``POST /v1/chat/completions``.
 
     Returns:
         ``(content_text: str, response_data: dict)``.
     """
     url = _chat_url(api_base)
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    payload = _build_chat_payload(
+        model, messages, False, temperature, max_tokens,
+        seed=seed, enable_web_search=enable_web_search,
+        json_output=json_output,
+    )
     response = ZHANGYUAPI_post(
         url,
         timeout_seconds,
@@ -316,7 +321,8 @@ def _call_chat_nonstream(api_base, api_key, model, messages,
 
 
 def _call_chat(api_base, api_key, model, messages, timeout_seconds=600,
-               stream=False, temperature=0.7, max_tokens=4096):
+               stream=False, temperature=0.7, max_tokens=4096, seed=0,
+               enable_web_search=False, json_output=False):
     """Unified chat entry point — dispatches to stream or non-stream.
 
     Returns:
@@ -325,18 +331,23 @@ def _call_chat(api_base, api_key, model, messages, timeout_seconds=600,
     if stream:
         return _call_chat_stream(
             api_base, api_key, model, messages,
-            timeout_seconds, temperature, max_tokens,
+            timeout_seconds, temperature, max_tokens, seed=seed,
+            enable_web_search=enable_web_search,
+            json_output=json_output,
         )
     return _call_chat_nonstream(
         api_base, api_key, model, messages,
-        timeout_seconds, temperature, max_tokens,
+        timeout_seconds, temperature, max_tokens, seed=seed,
+        enable_web_search=enable_web_search,
+        json_output=json_output,
     )
 
 
 def _call_chat_with_retry(api_base, api_key, model, messages,
                            timeout_seconds=600, stream=False,
                            temperature=0.7, max_tokens=4096,
-                           retry_times=2):
+                           retry_times=2, seed=0, enable_web_search=False,
+                           json_output=False):
     """Call ``_call_chat`` with retry on transient errors.
 
     Retries on ``_RETRYABLE_EXCEPTIONS`` and retryable HTTP status codes
@@ -348,6 +359,8 @@ def _call_chat_with_retry(api_base, api_key, model, messages,
             return _call_chat(
                 api_base, api_key, model, messages,
                 timeout_seconds, stream, temperature, max_tokens,
+                seed=seed, enable_web_search=enable_web_search,
+                json_output=json_output,
             )
         except _RETRYABLE_EXCEPTIONS as exc:
             last_error = str(exc)
@@ -445,25 +458,15 @@ def _parse_json_response(raw):
         raise RuntimeError(f"schema 解析失败，模型输出非 JSON: {raw[:500]}")
 
 
-def _ratio_to_direction(aspect_ratio):
-    if aspect_ratio in _LANDSCAPE:
-        return "横版构图"
-    if aspect_ratio in _PORTRAIT:
-        return "竖版构图"
-    if aspect_ratio in _SQUARE:
-        return "方形构图"
-    return "由画面内容决定"
-
-
-def _build_input_payload(layout_type, optimize_strength, aspect_ratio,
-                         user_prompt, exact_text, text_policy):
+def _build_input_payload(layout_type, optimize_strength,
+                         user_prompt, text_policy):
     return {
         "layout_type": layout_type,
         "optimize_strength": optimize_strength,
-        "aspect_ratio": aspect_ratio,
-        "direction": _ratio_to_direction(aspect_ratio),
+        "aspect_ratio": "auto",
+        "direction": "由画面内容决定",
         "user_prompt": user_prompt or "",
-        "exact_text": exact_text or "",
+        "exact_text": "",
         "text_policy": text_policy,
     }
 
@@ -487,10 +490,10 @@ def _remove_text_hints(schema):
     return schema
 
 
-def _normalize_schema(schema, aspect_ratio, exact_text, text_policy,
+def _normalize_schema(schema, text_policy,
                       optimize_strength="", layout_type=""):
-    schema["aspect_ratio"] = aspect_ratio
-    schema["direction"] = _ratio_to_direction(aspect_ratio)
+    schema["aspect_ratio"] = "auto"
+    schema["direction"] = "由画面内容决定"
     schema["text_policy"] = text_policy
     schema["optimize_strength"] = optimize_strength
     schema["layout_type"] = layout_type
@@ -502,18 +505,15 @@ def _normalize_schema(schema, aspect_ratio, exact_text, text_policy,
     if not isinstance(schema.get("named_entities"), list):
         schema["named_entities"] = []
 
-    exact = exact_text.strip() if exact_text else ""
     if text_policy == "none":
         schema = _remove_text_hints(schema)
     elif text_policy == "preserve":
-        schema["text_requirements"] = [exact] if exact else []
+        schema["text_requirements"] = []
     elif text_policy == "enhance":
         if not schema.get("text_requirements"):
-            schema["text_requirements"] = [exact] if exact else []
+            schema["text_requirements"] = []
     elif text_policy != "generate":
-        schema["text_requirements"] = (
-            [exact] if exact else schema.get("text_requirements", [])
-        )
+        schema["text_requirements"] = schema.get("text_requirements", [])
 
     return schema
 
@@ -523,20 +523,14 @@ def _normalize_schema(schema, aspect_ratio, exact_text, text_policy,
 # ===================================================================
 
 class ZhangyuAPIPromptOptimizer:
-    """ComfyUI 提示词优化器 — 合并参考图模式 & 纯文本模式.
+    """ComfyUI 提示词优化器 — 两种模式手动切换.
 
-    根据是否连接参考图自动切换：
-
-    * **参考图模式** (有 ``reference_image_*`` 输入):
-      多模态模型分析参考图的构图/光影/色彩/风格 → 输出结构化提示词。
-
-    * **纯文本模式** (无参考图):
-      两阶段处理 — schema 解析 → 提示词渲染 → GPT-Image-2 优化提示词。
-
-    支持流式 / 非流式、系统提示词预设、模型自动获取。
+    * **提示词反推**：上传参考图 → 多模态 LLM 分析 → 反推出提示词。
+    * **提示词优化**：输入文字需求 → 两阶段 LLM（Schema 解析 → 渲染）→ 输出优化提示词。
     """
 
     # Widget option pools
+    MODE_OPTIONS = ["提示词反推", "提示词优化"]
     LAYOUT_TYPES = ["自动判断", "纯画面", "图文混排海报", "电商主图", "社媒封面"]
     TEXT_POLICIES = ["不加文字", "保留原文", "优化原文", "自动生成"]
     STRENGTH_OPTIONS = ["标准", "增强"]
@@ -545,14 +539,13 @@ class ZhangyuAPIPromptOptimizer:
         "只参考构图", "只参考色彩光影", "只参考版式",
     ]
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("optimized_prompt", "debug_info")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("optimized_prompt", "debug_info", "model_list")
     FUNCTION = "optimize"
     CATEGORY = CATEGORY
     DESCRIPTION = (
         "提示词优化器：域名+Key 即用，模型自动获取，"
-        "有参考图→多模态分析，无参考图→两阶段schema优化，"
-        "支持流式/非流式、系统提示词预设"
+        "提示词反推→多模态分析参考图，提示词优化→两阶段LLM优化"
     )
 
     @classmethod
@@ -560,67 +553,63 @@ class ZhangyuAPIPromptOptimizer:
         presets = _get_preset_names()
         return {
             "required": {
-                "api_key (API密钥)": (
+                "api_key (密钥)": (
                     "STRING", {"default": "", "multiline": False}),
-                "api_base (接口域名)": (
+                "api_base (API地址)": (
                     "STRING", {"default": DEFAULT_API_BASE_URL, "multiline": False}),
-                "user_prompt (用户需求)": (
+                "prompt (提示词)": (
                     "STRING", {"multiline": True, "default": ""}),
+                "mode (模式)": (
+                    cls.MODE_OPTIONS, {"default": "提示词优化"}),
                 "model (模型)": (
-                    ["auto (自动选择)"],),
-                "aspect_ratio (目标比例)": (
-                    ASPECT_RATIO_OPTIONS, {"default": "auto"}),
-                "seed (种子)": (
-                    "INT", {"default": 0, "min": 0, "max": 2147483647,
-                            "control_after_generate": True}),
-                "timeout_seconds (超时秒数)": (
-                    "INT", {"default": 600, "min": 30, "max": 1800}),
-                "stream (流式输出)": (
-                    "BOOLEAN", {"default": False}),
-                "temperature (创造性)": (
-                    "FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0,
-                              "step": 0.1}),
-                "max_tokens (最大长度)": (
-                    "INT", {"default": 4096, "min": 64, "max": 32768}),
-                "retry_times (重试次数)": (
-                    "INT", {"default": 2, "min": 1, "max": 5}),
+                    "STRING", {"default": "deepseek-v4-pro", "multiline": False,
+                               "placeholder": "默认 deepseek-v4-pro，留空自动获取"}),
+                "preset (预设)": (
+                    presets, {"default": "默认"}),
             },
             "optional": {
-                # Reference image inputs (triggers reference mode)
+                # ---- 参考图 ----
                 "reference_image_01": ("IMAGE",),
                 "reference_image_02": ("IMAGE",),
                 "reference_image_03": ("IMAGE",),
                 "reference_image_04": ("IMAGE",),
                 "reference_image_05": ("IMAGE",),
                 "subject_image": ("IMAGE",),
-                # Reference-mode only
-                "reference_mode (参考模式)": (
+                "reference_mode (参考范围)": (
                     cls.REFERENCE_MODES, {"default": "自动判断"}),
-                # Text-mode only
-                "layout_type (版式类型)": (
+                # ---- 文本模式参数 ----
+                "layout_type (画面版式)": (
                     cls.LAYOUT_TYPES, {"default": "自动判断"}),
-                "text_policy (文字策略)": (
+                "text_policy (画面文字)": (
                     cls.TEXT_POLICIES, {"default": "保留原文"}),
-                "optimize_strength (优化强度)": (
+                "optimize_strength (强度)": (
                     cls.STRENGTH_OPTIONS, {"default": "标准"}),
-                "exact_text (精确文字)": (
-                    "STRING", {"multiline": True, "default": ""}),
-                # Preset
-                "preset (预设)": (
-                    presets, {"default": "默认"}),
-                # Custom model override — if filled, takes precedence over the combo
-                "custom_model (自定义模型名)": (
-                    "STRING", {"default": "", "multiline": False}),
+                "enable_web_search (联网搜索)": (
+                    "BOOLEAN", {"default": False}),
+                "json_output (JSON输出)": (
+                    "BOOLEAN", {"default": False}),
+                # ---- 高级参数 ----
+                "seed (种子)": (
+                    "INT", {"default": 0, "min": 0, "max": 2147483647,
+                            "control_after_generate": True}),
+                "stream (流式)": (
+                    "BOOLEAN", {"default": False}),
+                "temperature (创造性)": (
+                    "FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0,
+                              "step": 0.1}),
+                "max_tokens (最大输出)": (
+                    "INT", {"default": 4096, "min": 64, "max": 32768}),
+                "timeout_seconds (超时)": (
+                    "INT", {"default": 600, "min": 30, "max": 1800}),
+                "retry_times (重试)": (
+                    "INT", {"default": 2, "min": 1, "max": 5}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # Include a sentinel for whether reference images are connected —
-        # connecting/disconnecting refs changes the entire execution path
-        # (reference mode vs. text mode).
-        has_refs = cls._has_reference_images(kwargs)
+        mode = kwargs.get("mode (模式)", "提示词优化")
         key = json.dumps(
             {
                 k: str(v) if not isinstance(v, (list, tuple))
@@ -636,38 +625,23 @@ class ZhangyuAPIPromptOptimizer:
             ensure_ascii=False,
         )
         return hashlib.md5(
-            f"{key}|has_refs={has_refs}".encode()
+            f"{key}|mode={mode}".encode()
         ).hexdigest()
 
     # ------------------------------------------------------------------
-    # Mode detection
+    # 提示词反推模式（参考图 → 提示词）
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _has_reference_images(kwargs):
-        """Return True if any reference image input is connected."""
-        for i in range(1, 6):
-            if kwargs.get(f"reference_image_{i:02d}") is not None:
-                return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Reference-image mode
-    # ------------------------------------------------------------------
-
-    def _optimize_from_references(self, api_base, api_key, model, kwargs,
-                                   timeout_seconds, stream, temperature,
-                                   max_tokens, retry_times, unique_id,
-                                   start_ts):
+    def _optimize_from_references(self, opts, kwargs, unique_id, start_ts):
         """Analyse reference images → optimized prompt."""
-        user_prompt = kwargs.get("user_prompt (用户需求)", "")
-        target_aspect_ratio = kwargs.get("aspect_ratio (目标比例)", "auto")
-        reference_mode = kwargs.get("reference_mode (参考模式)", "自动判断")
+        user_prompt = kwargs.get("prompt (提示词)", "")
+        target_aspect_ratio = "auto"
+        reference_mode = kwargs.get("reference_mode (参考范围)", "自动判断")
         subject_image = kwargs.get("subject_image")
         ref_mode_en = _REFERENCE_MODE_MAP.get(reference_mode, reference_mode)
 
         emit_runtime_status(unique_id, "running", "准备参考图",
-                            0.0, 1, 1, timeout_seconds)
+                            0.0, 1, 1, opts["timeout_seconds"])
 
         # Collect reference image URLs (all slots guarded against None)
         ref_images = []
@@ -690,22 +664,24 @@ class ZhangyuAPIPromptOptimizer:
 
         emit_runtime_status(
             unique_id, "running",
-            f"分析 {len(ref_urls)} 张参考图{' (流式)' if stream else ''}",
-            time.time() - start_ts, 1, 1, timeout_seconds,
+            f"分析 {len(ref_urls)} 张参考图{' (流式)' if opts['stream'] else ''}",
+            time.time() - start_ts, 1, 1, opts["timeout_seconds"],
         )
         print(
             f"[ZhangyuAPI Prompt Optimizer] reference mode, "
-            f"images={len(ref_urls)}, model={model}, stream={stream}"
+            f"images={len(ref_urls)}, model={opts['model']}, stream={opts['stream']}"
         )
 
         raw, _data = _call_chat_with_retry(
-            api_base, api_key, model, messages,
-            timeout_seconds, stream, temperature, max_tokens,
-            retry_times=retry_times,
+            opts["api_base"], opts["api_key"], opts["model"], messages,
+            opts["timeout_seconds"], opts["stream"], opts["temperature"], opts["max_tokens"],
+            retry_times=opts["retry_times"], seed=opts["seed"],
+            enable_web_search=opts["enable_web_search"],
+            json_output=opts["json_output"],
         )
 
         emit_runtime_status(unique_id, "running", "解析提示词",
-                            time.time() - start_ts, 1, 1, timeout_seconds)
+                            time.time() - start_ts, 1, 1, opts["timeout_seconds"])
 
         optimized_prompt, reference_summary = _parse_tagged_output(raw)
         if not optimized_prompt:
@@ -715,34 +691,30 @@ class ZhangyuAPIPromptOptimizer:
         emit_runtime_status(
             unique_id, "success",
             f"提示词生成完成 (耗时 {elapsed:.1f}s)",
-            elapsed, 1, 1, timeout_seconds,
+            elapsed, 1, 1, opts["timeout_seconds"],
         )
         return optimized_prompt, reference_summary
 
     # ------------------------------------------------------------------
-    # Text-only mode (two-stage schema → render)
+    # 提示词优化模式（文本 → 两阶段 schema → 渲染）
     # ------------------------------------------------------------------
 
-    def _optimize_from_text(self, api_base, api_key, model, kwargs,
-                             timeout_seconds, stream, temperature,
-                             max_tokens, retry_times, unique_id, start_ts):
+    def _optimize_from_text(self, opts, kwargs, unique_id, start_ts):
         """Two-stage text optimisation: schema parse → prompt render."""
-        user_prompt = kwargs.get("user_prompt (用户需求)", "")
-        layout_type = kwargs.get("layout_type (版式类型)", "自动判断")
-        text_policy_raw = kwargs.get("text_policy (文字策略)", "保留原文")
-        optimize_strength_raw = kwargs.get("optimize_strength (优化强度)", "标准")
-        aspect_ratio = kwargs.get("aspect_ratio (目标比例)", "16:9")
-        exact_text = kwargs.get("exact_text (精确文字)", "") or ""
+        user_prompt = kwargs.get("prompt (提示词)", "")
+        layout_type = kwargs.get("layout_type (画面版式)", "自动判断")
+        text_policy_raw = kwargs.get("text_policy (画面文字)", "保留原文")
+        optimize_strength_raw = kwargs.get("optimize_strength (强度)", "标准")
 
         optimize_strength = _STRENGTH_MAP.get(optimize_strength_raw, optimize_strength_raw)
         text_policy = _TEXT_POLICY_MAP.get(text_policy_raw, text_policy_raw)
 
         # ---- Stage 1: Schema parsing ----
         emit_runtime_status(unique_id, "running", "解析需求结构",
-                            0.0, 1, 2, timeout_seconds)
+                            0.0, 1, 2, opts["timeout_seconds"])
         payload = _build_input_payload(
-            layout_type, optimize_strength, aspect_ratio,
-            user_prompt, exact_text, text_policy,
+            layout_type, optimize_strength,
+            user_prompt, text_policy,
         )
         schema_messages = [
             {"role": "system", "content": _SCHEMA_PARSER_PROMPT},
@@ -750,19 +722,21 @@ class ZhangyuAPIPromptOptimizer:
         ]
         print(
             f"[ZhangyuAPI Prompt Optimizer] text mode stage-1, "
-            f"model={model}, stream={stream}"
+            f"model={opts['model']}, stream={opts['stream']}"
         )
         schema_raw, _data = _call_chat_with_retry(
-            api_base, api_key, model, schema_messages,
-            timeout_seconds, stream, temperature, max_tokens,
-            retry_times=retry_times,
+            opts["api_base"], opts["api_key"], opts["model"], schema_messages,
+            opts["timeout_seconds"], opts["stream"], opts["temperature"], opts["max_tokens"],
+            retry_times=opts["retry_times"], seed=opts["seed"],
+            enable_web_search=opts["enable_web_search"],
+            json_output=opts["json_output"],
         )
 
         emit_runtime_status(unique_id, "running", "整理 Schema",
-                            time.time() - start_ts, 1, 2, timeout_seconds)
+                            time.time() - start_ts, 1, 2, opts["timeout_seconds"])
         schema = _parse_json_response(schema_raw)
         schema = _normalize_schema(
-            schema, aspect_ratio, exact_text, text_policy,
+            schema, text_policy,
             optimize_strength, layout_type,
         )
 
@@ -772,15 +746,17 @@ class ZhangyuAPIPromptOptimizer:
             {"role": "user", "content": json.dumps(schema, ensure_ascii=False)},
         ]
         emit_runtime_status(unique_id, "running", "渲染最终提示词",
-                            time.time() - start_ts, 2, 2, timeout_seconds)
+                            time.time() - start_ts, 2, 2, opts["timeout_seconds"])
         print(
             f"[ZhangyuAPI Prompt Optimizer] text mode stage-2, "
-            f"model={model}"
+            f"model={opts['model']}"
         )
         optimized, _data = _call_chat_with_retry(
-            api_base, api_key, model, renderer_messages,
-            timeout_seconds, stream, temperature, max_tokens,
-            retry_times=retry_times,
+            opts["api_base"], opts["api_key"], opts["model"], renderer_messages,
+            opts["timeout_seconds"], opts["stream"], opts["temperature"], opts["max_tokens"],
+            retry_times=opts["retry_times"], seed=opts["seed"],
+            enable_web_search=opts["enable_web_search"],
+            json_output=opts["json_output"],
         )
 
         # Post-processing
@@ -801,19 +777,16 @@ class ZhangyuAPIPromptOptimizer:
                 flags=re.DOTALL,
             )
 
-        direction = _ratio_to_direction(aspect_ratio)
         debug_info = (
-            f"model={model}\n"
-            f"api_base={denormalize_api_base(api_base)}\n"
+            f"model={opts['model']}\n"
+            f"api_base={denormalize_api_base(opts['api_base'])}\n"
             f"layout_type={layout_type}\n"
             f"optimize_strength={optimize_strength}\n"
-            f"aspect_ratio={aspect_ratio}\n"
-            f"direction={direction}\n"
             f"text_policy={text_policy}\n"
-            f"has_exact_text={str(bool(exact_text.strip())).lower()}\n"
-            f"stream={stream}\n"
-            f"temperature={temperature}\n"
-            f"max_tokens={max_tokens}\n"
+            f"has_exact_text=false\n"
+            f"stream={opts['stream']}\n"
+            f"temperature={opts['temperature']}\n"
+            f"max_tokens={opts['max_tokens']}\n"
             f"resolved_layout_type={schema.get('image_type', '')}\n"
             f"resolved_text_policy={schema.get('text_policy', '')}\n"
             f"schema_result={json.dumps(schema, ensure_ascii=False)}\n"
@@ -823,7 +796,7 @@ class ZhangyuAPIPromptOptimizer:
         emit_runtime_status(
             unique_id, "success",
             f"提示词生成完成 (耗时 {elapsed:.1f}s)",
-            elapsed, 2, 2, timeout_seconds,
+            elapsed, 2, 2, opts["timeout_seconds"],
         )
         return optimized, debug_info
 
@@ -840,20 +813,21 @@ class ZhangyuAPIPromptOptimizer:
         Returns:
             ``(optimized_prompt: str, debug_info: str)``.
         """
-        api_key = kwargs.get("api_key (API密钥)", "")
+        api_key = kwargs.get("api_key (密钥)", "")
         api_base = normalize_api_base(
-                kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL)
+                kwargs.get("api_base (API地址)", DEFAULT_API_BASE_URL)
             )
-        model = kwargs.get("model (模型)", "auto (自动选择)")
-        custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
-        if custom_model:
-            model = custom_model
-            _log("info", f"[用户自定义模型] {model}")
-        timeout_seconds = kwargs.get("timeout_seconds (超时秒数)", 600)
-        stream = kwargs.get("stream (流式输出)", False)
+        model = kwargs.get("model (模型)", "").strip()
+        timeout_seconds = kwargs.get("timeout_seconds (超时)", 600)
+        stream = kwargs.get("stream (流式)", False)
         temperature = float(kwargs.get("temperature (创造性)", 0.7))
-        max_tokens = int(kwargs.get("max_tokens (最大长度)", 4096))
-        retry_times = int(kwargs.get("retry_times (重试次数)", 2))
+        max_tokens = int(kwargs.get("max_tokens (最大输出)", 4096))
+        retry_times = int(kwargs.get("retry_times (重试)", 2))
+        enable_web_search = kwargs.get("enable_web_search (联网搜索)", False)
+        json_output = kwargs.get("json_output (JSON输出)", False)
+        seed = int(kwargs.get("seed (种子)", 0))
+        if seed == 0:
+            seed = random.randint(1, 2147483647)
         unique_id = kwargs.get("unique_id")
         start_ts = time.time()
 
@@ -865,9 +839,9 @@ class ZhangyuAPIPromptOptimizer:
 
         # -- resolve & validate model (placeholder → auto-detect) -----------
         try:
-            model, _model_list = resolve_and_validate_model(
+            model, model_list = resolve_and_validate_model(
                 model, api_base, api_key.strip(), unique_id,
-                placeholder="auto (自动选择)",
+                placeholder="",
                 filter_func=_filter_chat_models,
             )
         except ValueError as exc:
@@ -899,18 +873,30 @@ class ZhangyuAPIPromptOptimizer:
                                 and kwargs[kwarg_key] == widget_default):
                             kwargs[kwarg_key] = preset_val
 
-            if self._has_reference_images(kwargs):
-                return self._optimize_from_references(
-                    api_base, api_key, model, kwargs,
-                    timeout_seconds, stream, temperature, max_tokens,
-                    retry_times, unique_id, start_ts,
+                # Auto-fill prompt from preset template if prompt is empty
+                current_prompt = kwargs.get("prompt (提示词)", "").strip()
+                if not current_prompt and preset.get("prompt_template"):
+                    kwargs["prompt (提示词)"] = preset["prompt_template"]
+                    _log("info", f"[预设模板] 已自动填充 prompt: {preset['prompt_template']}")
+
+            mode = kwargs.get("mode (模式)", "提示词优化")
+            opts = {
+                "api_base": api_base, "api_key": api_key, "model": model,
+                "timeout_seconds": timeout_seconds, "stream": stream,
+                "temperature": temperature, "max_tokens": max_tokens,
+                "retry_times": retry_times, "seed": seed,
+                "enable_web_search": enable_web_search,
+                "json_output": json_output,
+            }
+            if mode == "提示词反推":
+                opt, dbg = self._optimize_from_references(
+                    opts, kwargs, unique_id, start_ts,
                 )
             else:
-                return self._optimize_from_text(
-                    api_base, api_key, model, kwargs,
-                    timeout_seconds, stream, temperature, max_tokens,
-                    retry_times, unique_id, start_ts,
+                opt, dbg = self._optimize_from_text(
+                    opts, kwargs, unique_id, start_ts,
                 )
+            return opt, dbg, json.dumps(model_list, ensure_ascii=False)
         except Exception as exc:
             emit_runtime_status(
                 unique_id, "error", str(exc),
@@ -1108,6 +1094,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ZhangyuAPIPromptOptimizer": "ComfyUI-zhangyuapi-提示词优化器 🧪测试中",
-    "ZhangyuAPITextListEditor": "ComfyUI-zhangyuapi-文本停留编辑器 🧪测试中",
+    "ZhangyuAPIPromptOptimizer": "ComfyUI-zhangyuapi-提示词优化器",
+    "ZhangyuAPITextListEditor": "ComfyUI-zhangyuapi-文本停留编辑器",
 }

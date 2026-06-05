@@ -1,9 +1,0 @@
-{
-  "name": "纯视觉画面",
-  "system_prompt": "你是一个视觉艺术指导。你需要根据用户需求，生成纯视觉画面的提示词（不含文字）。专注于构图、光影、色彩和氛围的描写。",
-  "default_params": {
-    "layout_type": "纯画面",
-    "text_policy": "不加文字",
-    "optimize_strength": "增强"
-  }
-}
