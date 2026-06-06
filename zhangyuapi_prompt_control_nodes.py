@@ -33,8 +33,8 @@ from .zhangyu_gpt_img2 import (
     tensor_to_data_url,
     emit_runtime_status,
     DEFAULT_API_BASE_URL,
-    # Model resolution & validation
-    resolve_and_validate_model,
+    # Model list (output port only, no validation)
+    fetch_available_models_cached,
     _filter_chat_models,
     _log,
 )
@@ -837,17 +837,17 @@ class ZhangyuAPIPromptOptimizer:
                                 0.0, 0, 1, timeout_seconds)
             raise ValueError("API Key 不能为空")
 
-        # -- resolve & validate model (placeholder → auto-detect) -----------
+        # -- fetch model list for output port (best-effort) --------------------
+        model_list = []
         try:
-            model, model_list = resolve_and_validate_model(
-                model, api_base, api_key.strip(), unique_id,
-                placeholder="",
-                filter_func=_filter_chat_models,
-            )
-        except ValueError as exc:
-            emit_runtime_status(unique_id, "error", str(exc),
-                                0.0, 0, 1, timeout_seconds)
-            raise
+            all_models = fetch_available_models_cached(
+                api_base, api_key.strip())
+            model_list = _filter_chat_models(all_models)
+        except Exception as exc:
+            _log("warn", f"获取模型列表失败（不影响优化）: {exc}")
+
+        if not model:
+            model = "deepseek-v4-pro"
 
         try:
             # Apply preset if selected

@@ -15,12 +15,12 @@ zhangyu_img.py           # ComfyuiZhangyuAPIUniversalImageNode — generic OpenA
 video_node.py            # ComfyuiZhangyuAPIVideoNode — video generation with async polling
 zhangyuapi_prompt_control_nodes.py  # ZhangyuAPIPromptOptimizer + ZhangyuAPITextListEditor
 prompts/                 # LLM system prompt templates (txt) + presets (JSON)
-web/extensions/          # Frontend JS: runtime status bar + model-fetcher button
+web/extensions/          # Frontend JS: runtime status bar + preset helper
 ```
 
 ### Module dependency graph
 
-`zhangyu_gpt_img2.py` is the **shared foundation module** — it defines the per-thread HTTP/2 client, retry/backoff helpers, adaptive polling, image tensor conversion, size tables, frontend status emitter, and PromptServer routes for model fetching. **All other node modules import from it.**
+`zhangyu_gpt_img2.py` is the **shared foundation module** — it defines the per-thread HTTP/2 client, retry/backoff helpers, adaptive polling, image tensor conversion, size tables, and frontend status emitter. **All other node modules import from it.**
 
 - `zhangyu_img.py` imports ~20 shared functions from `zhangyu_gpt_img2`
 - `video_node.py` imports ~15 shared functions from `zhangyu_gpt_img2`
@@ -32,7 +32,7 @@ ComfyUI invokes `generate()` / `optimize()` from a **ThreadPoolExecutor**. Since
 
 ### Backend ↔ Frontend communication
 
-- **Model fetching**: Python registers `aiohttp` routes (e.g. `POST /zhangyuapi_fetch_models`) on ComfyUI's PromptServer at import time. The JS model-fetcher extension calls these routes.
+- **Model input**: All nodes use a STRING widget for manual model name input (auto-fetch was removed).
 - **Runtime status**: Python calls `emit_runtime_status()` → `PromptServer.instance.send_sync("comfyui_zhangyuapi_status", ...)`. The JS status extension listens for these events and renders a progress bar per node.
 - **Text-list editor**: Uses a session-based pause/confirm pattern with `_pending_text_lists` dict + routes like `POST /zhangyuapi_text_list_edit/confirm`.
 
@@ -47,8 +47,7 @@ This is a ComfyUI custom node package — there is **no build step, no linter co
 1. Create a new `.py` module with a node class, `NODE_CLASS_MAPPINGS`, and `NODE_DISPLAY_NAME_MAPPINGS`.
 2. Import and merge into `__init__.py`.
 3. If the node needs a runtime status bar, add its class name to `TARGET_NODE_TYPES` in the JS status extension.
-4. If the node needs the "🔄 获取模型" button, add its class name to `TARGET_NODE_TYPES` in the JS model-fetcher extension and (if needed) to `MODEL_FETCH_ROUTE_MAP`.
-5. Register any new PromptServer route in the module's top-level `try/except` block (copy the existing route-registration pattern).
+4. Register any new PromptServer route in the module's top-level `try/except` block (copy the existing route-registration pattern).
 
 ### Widget naming convention
 
@@ -68,7 +67,6 @@ The `prompts/` directory contains:
 
 | Endpoint | Used by |
 |---|---|
-| `GET /v1/models` | Model list fetching (all nodes) |
 | `POST /v1/images/generations` | Image-2 node (text2img), Universal node |
 | `POST /v1/images/edits` | Image-2 node (img2img / inpainting) |
 | `POST /v1/videos` or `/v1/videos/generations` | Video node (auto-detects) |

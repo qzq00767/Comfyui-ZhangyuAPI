@@ -1140,14 +1140,21 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API"):
             url_items.append(item["url"])
 
     # b64_json: decode synchronously to uint8 (CPU-bound, fast)
-    for b64 in b64_items:
-        tensors.append(b64_json_to_uint8(b64))
+    for idx, b64 in enumerate(b64_items):
+        try:
+            tensors.append(b64_json_to_uint8(b64))
+        except Exception as exc:
+            print(
+                f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(b64_items)} 张图"
+                f" base64 解码失败，已跳过: {exc}"
+            )
 
-    # URLs: download all concurrently (returns uint8 tensors)
+    # URLs: download all concurrently, returns (tensors, successful_urls)
+    successful_urls = []
     if url_items:
-        tensors.extend(
-            _download_images_async(url_items, timeout_seconds)
-        )
+        url_tensors, successful_urls = _download_images_async(
+            url_items, timeout_seconds)
+        tensors.extend(url_tensors)
 
     if not tensors:
         raise RuntimeError(
@@ -1156,7 +1163,7 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API"):
         )
 
     # Batch GPU transfer + normalize in one pass
-    return _batch_uint8_to_image(tensors), url_items
+    return _batch_uint8_to_image(tensors), successful_urls
 
 
 def _download_images_async(urls, timeout_seconds,
@@ -1167,6 +1174,9 @@ def _download_images_async(urls, timeout_seconds,
     connection reuse.  PIL decoding is offloaded to :data:`_PIL_EXECUTOR`
     so CPU work overlaps with remaining network I/O.
 
+    **Fault-tolerant**: individual image failures are logged and skipped;
+    the batch continues as long as at least one image succeeds.
+
     Shared by all image-generation nodes in this package.
 
     Args:
@@ -1175,10 +1185,12 @@ def _download_images_async(urls, timeout_seconds,
         retry_times: Max attempts per URL.
 
     Returns:
-        ``list[torch.Tensor]`` — one ``(1, H, W, 3)`` uint8 tensor per URL.
+        ``(list[torch.Tensor], list[str])`` — uint8 tensors (one per
+        successfully downloaded image) and the corresponding URL list
+        (failed URLs are excluded).
 
     Raises:
-        RuntimeError: If any URL fails all *retry_times* attempts.
+        RuntimeError: If **all** URLs fail after *retry_times* attempts.
 
     """
     if not urls:
@@ -1246,13 +1258,31 @@ def _download_images_async(urls, timeout_seconds,
                 *tasks, return_exceptions=True)
 
         tensors = []
+        successful_urls = []
+        failed_count = 0
         for idx, r in enumerate(results):
             if isinstance(r, Exception):
-                raise RuntimeError(
-                    f"下载图片失败 (index={idx}, url={urls[idx][:200]}): {r}"
+                failed_count += 1
+                print(
+                    f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(urls)} 张图"
+                    f" 下载失败，已跳过"
+                    f" (url={urls[idx][:200]}): {r}"
                 )
+                continue
             tensors.append(r)
-        return tensors
+            successful_urls.append(urls[idx])
+
+        if not tensors:
+            raise RuntimeError(
+                f"所有 {len(urls)} 张图片下载均失败，"
+                f"无法继续（可能是网络或远端服务问题）"
+            )
+        if failed_count:
+            print(
+                f"[Comfyui-ZhangyuAPI] 图片下载: {len(tensors)}/{len(urls)} 成功, "
+                f"{failed_count} 张被跳过"
+            )
+        return tensors, successful_urls
 
     return _run_async_coroutine(_gather())
 
@@ -1304,9 +1334,7 @@ class ComfyuiZhangyuAPIImage2Node:
                 "mode (模式)": (
                     ["AUTO", "text2img", "img2img"], {"default": "AUTO"}),
                 "model (模型)": (
-                    cls.MODELS, {"default": "gpt-image-2"}),
-                "custom_model (自定义模型名)": (
-                    "STRING", {"default": "", "multiline": False}),
+                    "STRING", {"default": "gpt-image-2", "multiline": False}),
                 "n (生成数量-谨慎使用)": (
                     "INT", {"default": 1, "min": 1, "max": 5}),
                 "api_base (接口域名)": (
@@ -1521,11 +1549,7 @@ class ComfyuiZhangyuAPIImage2Node:
         api_key = kwargs.get("api_key (API密钥)", "")
         prompt = kwargs.get("prompt (提示词)", "")
         mode = kwargs.get("mode (模式)", "AUTO")
-        model = kwargs.get("model (模型)", "gpt-image-2")
-        custom_model = (kwargs.get("custom_model (自定义模型名)") or "").strip()
-        if custom_model:
-            model = custom_model
-            _log("info", f"[用户自定义模型] {model}")
+        model = (kwargs.get("model (模型)") or "").strip() or "gpt-image-2"
         n_images = safe_int(kwargs.get("n (生成数量-谨慎使用)", 1), 1, 1, 5)
         api_base = normalize_api_base(
                 kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL)
@@ -1603,17 +1627,13 @@ class ComfyuiZhangyuAPIImage2Node:
         emit_runtime_status(unique_id, "running", "开始生成",
                             0.0, 0, retry_times, timeout_seconds)
 
-        # -- resolve & validate model against live API list ----------------
+        # -- fetch model list for output port (best-effort) --------------------
+        model_list = []
         try:
-            model, model_list = resolve_and_validate_model(
-                model, api_base, api_key.strip(), unique_id,
-                placeholder="gpt-image-2",
-                filter_func=None,
-            )
-        except ValueError as exc:
-            emit_runtime_status(unique_id, "error", str(exc),
-                                0.0, 0, retry_times, timeout_seconds)
-            raise
+            model_list = fetch_available_models_cached(
+                api_base, api_key.strip())
+        except Exception as exc:
+            _log("warn", f"获取模型列表失败（不影响生成）: {exc}")
 
         # -- retry loop -------------------------------------------------------
         last_error = None
@@ -1830,12 +1850,15 @@ def _filter_image_models(all_models):
                                        mode="exclude", fallback_empty=False)
 
 # ===================================================================
-# TTL-cached model-list fetching
+# TTL-cached model-list fetching (with thundering-herd prevention)
 # ===================================================================
 
 _MODEL_CACHE = {}
 _MODEL_CACHE_LOCK = threading.Lock()
-DEFAULT_MODEL_CACHE_TTL = 300  # seconds
+_MODEL_FETCH_LOCKS = {}        # per-key lock — prevents concurrent fetches
+_MODEL_FETCH_LOCKS_LOCK = threading.Lock()  # guards _MODEL_FETCH_LOCKS dict
+DEFAULT_MODEL_CACHE_TTL = 900  # seconds (15 min — model lists change rarely)
+DEFAULT_MODEL_FETCH_TIMEOUT = 10  # seconds (quick fail, not worth waiting)
 
 
 def _make_cache_key(api_base, api_key):
@@ -1844,21 +1867,44 @@ def _make_cache_key(api_base, api_key):
     return (normalize_api_base(api_base or DEFAULT_API_BASE_URL), key_hash)
 
 
+def _get_or_create_key_lock(cache_key):
+    """Return the per-cache-key ``threading.Lock``, creating it if needed.
+
+    Serialises fetches for the same credentials so that when N threads
+    encounter a cold/expired cache simultaneously, only **one** thread
+    hits the remote API — the others wait on the lock and then read
+    the freshly populated cache.
+    """
+    with _MODEL_FETCH_LOCKS_LOCK:
+        key_lock = _MODEL_FETCH_LOCKS.get(cache_key)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _MODEL_FETCH_LOCKS[cache_key] = key_lock
+        return key_lock
+
+
 def fetch_available_models_cached(api_base, api_key, ttl=None,
-                                  timeout_seconds=DEFAULT_FETCH_TIMEOUT,
+                                  timeout_seconds=None,
                                   force_refresh=False):
-    """Fetch model IDs with in-memory TTL cache.
+    """Fetch model IDs with in-memory TTL cache + thundering-herd protection.
 
-    Cache hit → return immediately (unless *force_refresh*).
-    Cache miss/expired/forced → live fetch, update cache.
-    Live fetch fails + stale cache exists → return stale + log warning.
-    Live fetch fails + no stale → raise.
+    - Cache hit → return immediately (unless *force_refresh*).
+    - Cache miss / expired / forced → live fetch; if another thread is
+      already fetching for the same credentials, wait for it to finish
+      instead of making a duplicate API call.
+    - Live fetch fails + stale cache exists → return stale + log warning.
+    - Live fetch fails + no stale → raise.
 
-    Thread-safe via :data:`_MODEL_CACHE_LOCK`.
+    Thread-safe.  The per-key lock ensures only one ``GET /v1/models``
+    is in-flight per credential set at any time, so short bursts of
+    concurrent executions won't trigger rate-limiting.
     """
     ttl = ttl if ttl is not None else DEFAULT_MODEL_CACHE_TTL
+    timeout = (timeout_seconds if timeout_seconds is not None
+               else DEFAULT_MODEL_FETCH_TIMEOUT)
     cache_key = _make_cache_key(api_base, api_key)
 
+    # Fast path — cache hit (no lock contention for the common case)
     if not force_refresh:
         with _MODEL_CACHE_LOCK:
             entry = _MODEL_CACHE.get(cache_key)
@@ -1867,37 +1913,56 @@ def fetch_available_models_cached(api_base, api_key, ttl=None,
                 if age < ttl:
                     return entry["models"][:]
 
-    # Cache miss or expired — fetch live
-    try:
-        models = fetch_available_models(api_base, api_key, timeout_seconds)
-    except Exception as exc:
-        # Graceful degradation: fall back to stale cache
-        with _MODEL_CACHE_LOCK:
-            stale = _MODEL_CACHE.get(cache_key)
-            if stale is not None:
-                print(
-                    f"[Comfyui-ZhangyuAPI] 模型列表刷新失败，使用过期缓存 "
-                    f"(age={time.time() - stale['fetched_at']:.0f}s): {exc}"
-                )
-                return stale["models"][:]
-        raise  # no stale cache — propagate
+    # Slow path — serialise per key so only one thread fetches
+    key_lock = _get_or_create_key_lock(cache_key)
 
-    with _MODEL_CACHE_LOCK:
-        _MODEL_CACHE[cache_key] = {"models": models, "fetched_at": time.time()}
-    return models[:]
+    with key_lock:
+        # Double-check: another thread may have populated the cache
+        # while we were waiting for key_lock
+        if not force_refresh:
+            with _MODEL_CACHE_LOCK:
+                entry = _MODEL_CACHE.get(cache_key)
+                if entry is not None:
+                    age = time.time() - entry["fetched_at"]
+                    if age < ttl:
+                        return entry["models"][:]
+
+        try:
+            models = fetch_available_models(api_base, api_key, timeout)
+        except Exception as exc:
+            # Graceful degradation: fall back to stale cache
+            with _MODEL_CACHE_LOCK:
+                stale = _MODEL_CACHE.get(cache_key)
+                if stale is not None:
+                    print(
+                        f"[Comfyui-ZhangyuAPI] 模型列表刷新失败，使用过期缓存 "
+                        f"(age={time.time() - stale['fetched_at']:.0f}s): {exc}"
+                    )
+                    return stale["models"][:]
+            raise  # no stale cache — propagate
+
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[cache_key] = {"models": models, "fetched_at": time.time()}
+        return models[:]
 
 
 def clear_model_cache(api_base=None, api_key=None):
     """Clear the model-fetch cache.
 
     If credentials are given, only that entry is cleared;
-    otherwise the entire cache is purged.
+    otherwise the entire cache is purged (including stale per-key locks).
     """
     with _MODEL_CACHE_LOCK:
         if api_base is not None and api_key is not None:
-            _MODEL_CACHE.pop(_make_cache_key(api_base, api_key), None)
+            cache_key = _make_cache_key(api_base, api_key)
+            _MODEL_CACHE.pop(cache_key, None)
+            # Also clean up the corresponding per-key lock
+            with _MODEL_FETCH_LOCKS_LOCK:
+                _MODEL_FETCH_LOCKS.pop(cache_key, None)
         else:
             _MODEL_CACHE.clear()
+            with _MODEL_FETCH_LOCKS_LOCK:
+                _MODEL_FETCH_LOCKS.clear()
 
 
 # ===================================================================
@@ -2005,153 +2070,6 @@ def resolve_and_validate_model(model, api_base, api_key, unique_id,
         f"模型未选择且自动获取失败: {last_error}。"
         f"请点击 '🔄 获取模型' 按钮或手动输入模型名。"
     )
-
-
-try:
-    import asyncio as _asyncio_import_check  # noqa: F811 (re-import for clarity)
-
-    import server as _comfy_server
-    from aiohttp import web as _aiohttp_web
-
-    if (_comfy_server is not None
-            and _comfy_server.PromptServer.instance is not None):
-        _routes = _comfy_server.PromptServer.instance.routes
-
-        @_routes.post("/zhangyuapi_fetch_models")
-        async def _zhangyuapi_fetch_models_route(request):
-            """Handle ``POST /zhangyuapi_fetch_models`` from the frontend.
-
-            Expects JSON body: ``{"api_base": "...", "api_key": "..."}``.
-            Returns ``{"status": "success", "models": [...]}`` or an error.
-            """
-            try:
-                data = await request.json()
-                api_base = data.get("api_base", "")
-                api_key = data.get("api_key", "")
-
-                if not api_key or not api_key.strip():
-                    return _aiohttp_web.json_response(
-                        {"status": "error", "message": "API Key 不能为空"},
-                        status=400,
-                    )
-
-                loop = _asyncio_import_check.get_running_loop()
-                models = await loop.run_in_executor(
-                    None,
-                    lambda: fetch_available_models_cached(
-                        api_base,
-                        api_key.strip(),
-                        timeout_seconds=DEFAULT_FETCH_TIMEOUT,
-                    ),
-                )
-
-                return _aiohttp_web.json_response(
-                    {"status": "success", "models": models},
-                )
-            except RuntimeError as exc:
-                msg = str(exc)
-                print(f"Comfyui-ZhangyuAPI: fetch models error: {msg}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": msg}, status=502,
-                )
-            except Exception as exc:
-                print(f"Comfyui-ZhangyuAPI: fetch models error: {exc}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": str(exc)}, status=500,
-                )
-
-        @_routes.post("/zhangyuapi_fetch_chat_models")
-        async def _zhangyuapi_fetch_chat_models_route(request):
-            """Handle ``POST /zhangyuapi_fetch_chat_models``.
-
-            Like ``/zhangyuapi_fetch_models`` but filters out known
-            image-only / video-only models so the prompt-optimizer
-            dropdown only shows chat-capable models.
-            """
-            try:
-                data = await request.json()
-                api_base = data.get("api_base", "")
-                api_key = data.get("api_key", "")
-
-                if not api_key or not api_key.strip():
-                    return _aiohttp_web.json_response(
-                        {"status": "error", "message": "API Key 不能为空"},
-                        status=400,
-                    )
-
-                loop = _asyncio_import_check.get_running_loop()
-                all_models = await loop.run_in_executor(
-                    None,
-                    lambda: fetch_available_models_cached(
-                        api_base,
-                        api_key.strip(),
-                        timeout_seconds=DEFAULT_FETCH_TIMEOUT,
-                    ),
-                )
-
-                chat_models = _filter_chat_models(all_models)
-                return _aiohttp_web.json_response(
-                    {"status": "success", "models": chat_models},
-                )
-            except RuntimeError as exc:
-                msg = str(exc)
-                print(f"Comfyui-ZhangyuAPI: fetch chat models error: {msg}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": msg}, status=502,
-                )
-            except Exception as exc:
-                print(f"Comfyui-ZhangyuAPI: fetch chat models error: {exc}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": str(exc)}, status=500,
-                )
-
-        @_routes.post("/zhangyuapi_fetch_image_models")
-        async def _zhangyuapi_fetch_image_models_route(request):
-            """Handle ``POST /zhangyuapi_fetch_image_models``.
-
-            Like ``/zhangyuapi_fetch_models`` but filters out known
-            chat / video / TTS / embedding models so the universal image
-            generation node dropdown only shows image-capable models.
-            """
-            try:
-                data = await request.json()
-                api_base = data.get("api_base", "")
-                api_key = data.get("api_key", "")
-
-                if not api_key or not api_key.strip():
-                    return _aiohttp_web.json_response(
-                        {"status": "error", "message": "API Key 不能为空"},
-                        status=400,
-                    )
-
-                loop = _asyncio_import_check.get_running_loop()
-                all_models = await loop.run_in_executor(
-                    None,
-                    lambda: fetch_available_models_cached(
-                        api_base,
-                        api_key.strip(),
-                        timeout_seconds=DEFAULT_FETCH_TIMEOUT,
-                    ),
-                )
-
-                image_models = _filter_image_models(all_models)
-                return _aiohttp_web.json_response(
-                    {"status": "success", "models": image_models},
-                )
-            except RuntimeError as exc:
-                msg = str(exc)
-                print(f"Comfyui-ZhangyuAPI: fetch image models error: {msg}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": msg}, status=502,
-                )
-            except Exception as exc:
-                print(f"Comfyui-ZhangyuAPI: fetch image models error: {exc}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": str(exc)}, status=500,
-                )
-
-except Exception as _exc:
-    print(f"Warning: Could not register model-fetch route: {_exc}")
 
 
 # ===================================================================

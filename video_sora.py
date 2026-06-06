@@ -40,8 +40,7 @@ from .zhangyu_gpt_img2 import (
     _download_bytes_with_retry,
     # Frontend status
     emit_runtime_status,
-    # Model resolution
-    resolve_and_validate_model,
+    # Model list (output port only, no validation)
     _sanitize_api_response,
     _extract_api_error_message,
     _filter_models_by_patterns,
@@ -92,7 +91,7 @@ VIDEO_SIZES = [
     "1792x1024",     # HD 横屏
 ]
 
-# Video model filter patterns (include mode)
+# Video model filter patterns (for model_list output port)
 _SORA_MODEL_PATTERNS = [
     "sora",
 ]
@@ -104,57 +103,6 @@ def _filter_sora_models(all_models):
         all_models, _SORA_MODEL_PATTERNS,
         mode="include", fallback_empty=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Backend route for Sora model fetching
-# ---------------------------------------------------------------------------
-try:
-    import asyncio as _asyncio_import_check
-    import server as _comfy_server
-    from aiohttp import web as _aiohttp_web
-
-    if (_comfy_server is not None
-            and _comfy_server.PromptServer.instance is not None):
-        _routes = _comfy_server.PromptServer.instance.routes
-
-        @_routes.post("/zhangyuapi_fetch_sora_models")
-        async def _zhangyuapi_fetch_sora_models_route(request):
-            try:
-                data = await request.json()
-                api_base = data.get("api_base", "")
-                api_key = data.get("api_key", "")
-
-                if not api_key or not api_key.strip():
-                    return _aiohttp_web.json_response(
-                        {"status": "error", "message": "API Key 不能为空"},
-                        status=400,
-                    )
-
-                loop = _asyncio_import_check.get_running_loop()
-                all_models = await loop.run_in_executor(
-                    None,
-                    lambda: fetch_available_models_cached(
-                        api_base, api_key.strip(), timeout_seconds=30,
-                    ),
-                )
-                sora_models = _filter_sora_models(all_models)
-                return _aiohttp_web.json_response(
-                    {"status": "success", "models": sora_models},
-                )
-            except RuntimeError as exc:
-                msg = str(exc)
-                print(f"[Sora] fetch models error: {msg}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": msg}, status=502,
-                )
-            except Exception as exc:
-                print(f"[Sora] fetch models error: {exc}")
-                return _aiohttp_web.json_response(
-                    {"status": "error", "message": str(exc)}, status=500,
-                )
-except Exception as _exc:
-    print(f"Warning: Could not register Sora model-fetch route: {_exc}")
 
 
 # ===================================================================
@@ -534,17 +482,14 @@ class ComfyuiZhangyuAPISoraNode:
 
         width, height = _parse_size(size)
 
-        # -- resolve model ----------------------------------------------------
+        # -- fetch model list for output port (best-effort) --------------------
+        model_list = []
         try:
-            model, model_list = resolve_and_validate_model(
-                model, api_base, api_key, unique_id,
-                placeholder="sora",
-                filter_func=_filter_sora_models,
-            )
-        except ValueError as exc:
-            emit_runtime_status(unique_id, "error", str(exc),
-                                0.0, 0, retry_times, timeout_seconds)
-            raise
+            all_models = fetch_available_models_cached(
+                api_base, api_key)
+            model_list = _filter_sora_models(all_models)
+        except Exception as exc:
+            print(f"[Sora] 模型列表获取失败（不影响生成）: {exc}")
 
         # -- prepare request --------------------------------------------------
         headers = {"Authorization": f"Bearer {api_key}"}

@@ -45,9 +45,8 @@ _GEMINI_IMAGE_EXCLUDE = [
     "embedding", "text-embedding", "aqa",
 ]
 
-
 # ===================================================================
-# Gemini 模型列表获取
+# Gemini 模型列表获取（仅用于 model_list 输出端口）
 # ===================================================================
 
 def _fetch_gemini_models(api_base, api_key, timeout=10):
@@ -323,16 +322,13 @@ class ComfyuiZhangyuAPIGeminiNode:
         # Collect reference images
         image_data_urls = self._collect_images(kwargs)
 
-        # -- 获取模型列表 ---------------------------------------------------------
+        # -- fetch model list for output port (best-effort) --------------------
         model_list = []
         try:
             model_list = _fetch_gemini_models(api_base, api_key)
         except Exception as exc:
-            _log("warn", f"[Gemini] 模型列表获取失败: {exc}")
+            _log("warn", f"[Gemini] 模型列表获取失败（不影响生成）: {exc}")
 
-        if not model and model_list:
-            model = model_list[0]
-            _log("info", f"[Gemini] 自动选择模型: {model}")
         if not model:
             model = "nano-banana"
 

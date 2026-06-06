@@ -41,7 +41,7 @@ from .zhangyu_gpt_img2 import (
     normalize_size,
     tensor_to_data_url,
     _filter_image_models,
-    resolve_and_validate_model,
+    fetch_available_models_cached,
     emit_runtime_status,
 )
 
@@ -250,17 +250,14 @@ class ComfyuiZhangyuAPIUniversalImageNode:
         if not clean_prompt:
             raise ValueError("prompt 不能为空")
 
-        # -- resolve model ---------------------------------------------------
+        # -- fetch model list for output port (best-effort) --------------------
+        model_list = []
         try:
-            model, model_list = resolve_and_validate_model(
-                model, api_base, api_key.strip(), unique_id,
-                placeholder="从接口自动获取模型列表",
-                filter_func=_filter_image_models,
-            )
-        except ValueError as exc:
-            emit_runtime_status(unique_id, "error", str(exc),
-                                0.0, 0, retry_times, timeout_seconds)
-            raise
+            all_models = fetch_available_models_cached(
+                api_base, api_key.strip())
+            model_list = _filter_image_models(all_models)
+        except Exception as exc:
+            print(f"[Comfyui-ZhangyuAPI-OpenAI] 获取模型列表失败（不影响生成）: {exc}")
 
         # -- prepare request -------------------------------------------------
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
