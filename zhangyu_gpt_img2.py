@@ -24,12 +24,18 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import math
 from io import BytesIO
 
 import numpy as np
 from PIL import Image
 import httpx
 import torch
+
+try:
+    from comfy.utils import ProgressBar
+except ImportError:
+    ProgressBar = None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +89,13 @@ _RETRYABLE_EXCEPTIONS = (
     httpx.RemoteProtocolError,
 )
 
+# Extend with protocol-level errors that may not exist in older httpx
+for _name in ("LocalProtocolError", "ProtocolError"):
+    _cls = getattr(httpx, _name, None)
+    if _cls is not None and isinstance(_cls, type) and issubclass(_cls, Exception):
+        _RETRYABLE_EXCEPTIONS += (_cls,)
+del _name, _cls
+
 # ---------------------------------------------------------------------------
 # Centralized logging — timestamped, level-filtered, safe for multi-thread
 # ---------------------------------------------------------------------------
@@ -115,14 +128,21 @@ def _log(level, *args):
 # each thread gets its own client via threading.local().
 # ---------------------------------------------------------------------------
 _HTTP_CLIENT_LOCAL = threading.local()
+_HTTP_CLIENT_FALLBACK = threading.local()
 
 
 def _get_http_client():
-    """Return (or create) the per-thread ``httpx.Client`` instance."""
+    """Return (or create) the per-thread ``httpx.Client`` instance.
+
+    The client uses HTTP/1.1 with connection pooling.  When a
+    ``RemoteProtocolError`` or ``ConnectError`` occurs during a request,
+    :func:`_on_retryable_error` closes the current client so the next
+    retry creates a fresh TCP + TLS session.
+    """
     client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
     if client is None:
         _HTTP_CLIENT_LOCAL.client = httpx.Client(
-            http2=True,
+            http2=False,
             timeout=httpx.Timeout(DEFAULT_CONNECT_TIMEOUT,
                                   read=DEFAULT_READ_TIMEOUT,
                                   pool=DEFAULT_POOL_TIMEOUT),
@@ -135,6 +155,63 @@ def _get_http_client():
         )
         client = _HTTP_CLIENT_LOCAL.client
     return client
+
+
+# ---------------------------------------------------------------------------
+# Connection recovery helpers — when a TCP/TLS connection is reset or
+# fails, discard the stale per-thread client so the next attempt gets a
+# fresh connection (new DNS lookup, TCP connect, TLS handshake).
+# _HTTP_CLIENT_FALLBACK is reserved for future HTTP/2 re-enablement.
+# ---------------------------------------------------------------------------
+
+def _reset_http_client_for_retry():
+    """Close and discard the current per-thread ``httpx.Client``.
+
+    Call this before retrying after a ``ConnectError`` or
+    ``RemoteProtocolError`` to force a fresh TCP + TLS session.
+    """
+    client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass  # best-effort — the connection may already be broken
+    _HTTP_CLIENT_LOCAL.client = None
+
+
+def _on_retryable_error(exc):
+    """Handle a retryable exception before the next retry attempt.
+
+    Performs connection-level recovery:
+
+    * ``RemoteProtocolError`` / ``ConnectError``:
+      Discard the per-thread client so the retry creates a new TCP
+      connection and fresh TLS session.  This covers "Connection reset
+      by peer" (errno 104 / WinError 10054) caused by server-side
+      resets, middlebox interference, or stale keepalive connections.
+
+    * Other retryable exceptions (timeout, proxy error, etc.):
+      Only logged — no client reset is performed.
+
+    Callers should invoke this **after** catching a
+    ``_RETRYABLE_EXCEPTIONS`` and **before** ``_jittered_sleep()``.
+
+    Args:
+        exc: The caught exception instance.
+    """
+    exc_type = type(exc).__name__
+    exc_msg = str(exc)[:300]
+
+    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError)):
+        _log("warn",
+             f"{exc_type}，重置 HTTP 客户端以获取全新 TCP+TLS 连接: {exc_msg}")
+        _reset_http_client_for_retry()
+        # Also flag HTTP/2 fallback for future use (no-op while http2=False)
+        if isinstance(exc, httpx.RemoteProtocolError):
+            _HTTP_CLIENT_FALLBACK.disable_http2 = True
+    else:
+        _log("warn",
+             f"可重试异常 (不重置客户端): {exc_type}: {exc_msg}")
 
 
 # ===================================================================
@@ -156,10 +233,18 @@ def ZHANGYUAPI_timeout(timeout_seconds):
         read_to = int(timeout_seconds)
     except (TypeError, ValueError):
         read_to = DEFAULT_READ_TIMEOUT
-    connect_to = int(max(DEFAULT_CONNECT_TIMEOUT,
-                         min(DEFAULT_CONNECT_TIMEOUT * 4, read_to // 3)))
-    # Never let connect timeout exceed the read timeout
-    connect_to = min(connect_to, read_to)
+
+    # Guard against zero / negative timeout (would break socket I/O)
+    if read_to <= 0:
+        read_to = DEFAULT_READ_TIMEOUT
+
+    # Connect timeout: clamp to [min(read_to, 10), min(read_to, 30)].
+    # TCP + TLS should never need more than 30 s on modern infrastructure.
+    # Short cap means connection failures fail fast, leaving more time
+    # budget for the actual API request and retries.
+    min_connect = min(read_to, 10)
+    max_connect = min(read_to, 30)
+    connect_to = int(max(min_connect, min(max_connect, read_to // 3)))
     return httpx.Timeout(connect_to, read=read_to, pool=DEFAULT_POOL_TIMEOUT)
 
 
@@ -269,6 +354,61 @@ GPT_IMAGE2_SIZE_TABLE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Lightweight chat-completions helper (for auto-prompt, no external deps)
+# ---------------------------------------------------------------------------
+
+def _call_chat_simple(api_base, api_key, model, messages,
+                      timeout_seconds=120, temperature=0.7, max_tokens=512,
+                      retry_times=2):
+    """Call ``POST /v1/chat/completions`` and return the text content.
+
+    A self-contained helper that uses the shared HTTP infrastructure.
+    Lightweight alternative to importing from the prompt-controls module
+    (avoids circular imports).
+    """
+    url = f"{normalize_api_base(api_base)}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    last_error = None
+    for attempt in range(1, retry_times + 1):
+        try:
+            response = ZHANGYUAPI_post(url, timeout_seconds,
+                                       headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            choices = data.get("choices") or []
+            content = choices[0].get("message", {}).get("content", "") if choices else ""
+            return (content or "").strip(), data
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_error = str(exc)
+            if attempt < retry_times:
+                _on_retryable_error(exc)
+                _jittered_sleep(attempt)
+                continue
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            msg = str(exc)
+            m = re.search(r"HTTP (\d{3})", msg) if "HTTP " in msg else None
+            if m and is_retryable_http_status(int(m.group(1))):
+                if attempt < retry_times:
+                    _jittered_sleep(attempt)
+                    continue
+            raise
+
+    raise RuntimeError(f"LLM 调用失败: {last_error}")
+
+
 def _validate_gpt_image2_size(size_value):
     """Validate a literal ``WxH`` size string against gpt-image-2 constraints.
 
@@ -346,6 +486,11 @@ def normalize_size(image_size, aspect_ratio="1:1"):
 
     if option_lower.startswith("auto"):
         return "auto"
+
+    if option_lower.startswith("ratio"):
+        # "ratio_only" → always send only aspect_ratio (never size)
+        ratio = _extract_aspect_ratio(aspect_ratio)
+        return f"ratio:{ratio}" if ratio else "auto"
 
     match = re.match(r"(\d{3,4}x\d{3,4})", option_lower)
     if match:
@@ -520,6 +665,83 @@ def _batch_uint8_to_image(tensors):
     return batch.float().mul_(1.0 / 255.0)
 
 
+def _blank_image_tensor():
+    """Return a minimal blank IMAGE tensor for ``skip_error`` fallback.
+
+    Shape ``(1, 64, 64, 3)``, float32, all zeros (black).  Kept small
+    to avoid downstream size issues with resolution-dependent nodes.
+    """
+    return torch.zeros(1, 64, 64, 3)
+
+
+def _auto_downscale(image_tensor, max_total_pixels=4 * 1024 * 1024):
+    """Downscale an IMAGE tensor when total pixels exceed *max_total_pixels*.
+
+    Uses Lanczos resampling for quality.  Returns the original tensor
+    unchanged when no scaling is needed.
+
+    Args:
+        image_tensor: ``torch.Tensor`` of shape ``(B, H, W, C)``, float32 [0,1].
+        max_total_pixels: Threshold in total pixels (default 4 MP ≈ 2048×2048).
+
+    Returns:
+        ``torch.Tensor`` — same dtype / device / range as input.
+    """
+    was_3d = image_tensor.dim() == 3
+    if was_3d:
+        image_tensor = image_tensor.unsqueeze(0)     # (H,W,C) → (1,H,W,C)
+    samples = image_tensor.movedim(-1, 1)          # BHWC → BCHW
+    h, w = samples.shape[2], samples.shape[3]
+    current_pixels = h * w
+    if current_pixels <= max_total_pixels:
+        return image_tensor.squeeze(0) if was_3d else image_tensor
+
+    scale = math.sqrt(max_total_pixels / current_pixels)
+    new_w = round(w * scale)
+    new_h = round(h * scale)
+
+    # Pure-PyTorch Lanczos-like downscale via bilinear + sharpen, no comfy.utils dep
+    scaled = torch.nn.functional.interpolate(
+        samples, size=(new_h, new_w),
+        mode="bilinear", align_corners=False,
+    )
+    return scaled.movedim(1, -1)                    # BCHW → BHWC
+
+
+def _skip_error_return(error_msg, return_types, unique_id=None,
+                       retry_times=3, timeout_seconds=360):
+    """Build the error return tuple for ``skip_error`` mode.
+
+    - Emits an error status so the frontend shows the failure.
+    - Returns a tuple of blank/empty values matching *return_types*.
+
+    Args:
+        error_msg: Human-readable error description.
+        return_types: ``tuple[str]`` — ComfyUI return type codes
+            (``"IMAGE"``, ``"STRING"``, ``"VIDEO"``).
+        unique_id: Optional node ID for the status bar.
+        retry_times: Retry count for status display.
+        timeout_seconds: Timeout for status display.
+
+    Returns:
+        ``tuple`` — one blank value per return type.
+    """
+    if unique_id:
+        emit_runtime_status(unique_id, "error", error_msg,
+                            0, 0, retry_times, timeout_seconds)
+    blank_img = _blank_image_tensor()
+    parts = []
+    for t in return_types:
+        if t == "IMAGE":
+            parts.append(blank_img)
+        elif t == "VIDEO":
+            parts.append(blank_img)  # same tensor format, zero frames
+        else:
+            # STRING or any other text output — include the error
+            parts.append(f"skip_error: {error_msg}")
+    return tuple(parts)
+
+
 def b64_json_to_tensor(b64_json):
     """Decode an API ``b64_json`` field into a ComfyUI IMAGE tensor.
 
@@ -626,6 +848,7 @@ def _download_bytes_with_retry(url, headers, timeout_seconds,
         except _RETRYABLE_EXCEPTIONS as exc:
             last_error = str(exc)
             if attempt < retry_times:
+                _on_retryable_error(exc)
                 time.sleep(_jittered_backoff_seconds(attempt))
                 continue
             break
@@ -638,6 +861,15 @@ def _download_bytes_with_retry(url, headers, timeout_seconds,
             raise RuntimeError(
                 f"{label}下载失败 (url={url[:200]}): {exc}"
             ) from exc
+        except Exception as exc:
+            last_error = str(exc)
+            _log("warn",
+                 f"{label}下载遇到意外异常 (attempt={attempt}/{retry_times}, "
+                 f"type={type(exc).__name__}): {last_error}")
+            if attempt < retry_times:
+                time.sleep(_jittered_backoff_seconds(attempt))
+                continue
+            break
     raise RuntimeError(
         f"{label}下载连续 {retry_times} 次失败 "
         f"(url={url[:200]}): {last_error}"
@@ -744,7 +976,12 @@ def _poll_async_task(
 
             if response.status_code == 200:
                 consecutive_errors = 0
-                data = response.json()
+                try:
+                    data = response.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"轮询响应 JSON 解析失败 (task_id={task_id}): {exc}"
+                    ) from exc
                 status = str(data.get("status", "")).lower()
 
                 if status in ("completed", "succeeded", "success", "done"):
@@ -768,9 +1005,25 @@ def _poll_async_task(
 
         except _RETRYABLE_EXCEPTIONS as exc:
             consecutive_errors += 1
+            _on_retryable_error(exc)
             if consecutive_errors > max_consecutive_errors:
                 raise RuntimeError(
                     f"轮询连续 {consecutive_errors} 次网络错误，中止: {exc}"
+                )
+        except RuntimeError:
+            # Permanent errors (bad status, JSON parse failure, task
+            # failure) — do NOT retry, propagate immediately
+            raise
+        except Exception as exc:
+            # Truly unexpected exceptions (e.g. threading errors, memory)
+            # — retry defensively, but fail on repeated occurrences
+            consecutive_errors += 1
+            _log("warn",
+                 f"轮询遇到意外异常 (consecutive_errors={consecutive_errors}, "
+                 f"type={type(exc).__name__}): {str(exc)[:300]}")
+            if consecutive_errors > max_consecutive_errors:
+                raise RuntimeError(
+                    f"轮询连续 {consecutive_errors} 次异常错误，中止: {exc}"
                 )
 
         # Wait before next poll — use jittered backoff after errors,
@@ -1039,6 +1292,22 @@ def _sanitize_api_response(data):
     return data
 
 
+def _safe_json_dumps(obj, **kwargs):
+    """``json.dumps`` wrapper that gracefully handles non-serializable types.
+
+    Non-JSON-safe objects (bytes, datetime, numpy scalars, etc.) are
+    converted to their ``str()`` representation instead of raising
+    ``TypeError``.  This is a safety net — in practice the API response
+    should always be JSON-safe, but a single non-serializable field
+    should not crash the entire output port.
+    """
+    kwargs.setdefault("ensure_ascii", False)
+    try:
+        return json.dumps(obj, **kwargs)
+    except (TypeError, ValueError):
+        return json.dumps(obj, default=str, **kwargs)
+
+
 def _strip_image_data(obj, max_preview=60):
     """Recursively remove / truncate base64 image data in *obj*.
 
@@ -1094,13 +1363,14 @@ def _extract_api_error_message(data):
         return str(data)[:500]
     error = data.get("error")
     if isinstance(error, dict):
-        return error.get("message") or json.dumps(error, ensure_ascii=False)
+        return error.get("message") or _safe_json_dumps(error)
     if isinstance(error, str):
         return error
-    return json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]
+    return _safe_json_dumps(_sanitize_api_response(data))[:500]
 
 
-def _parse_response_images(data, timeout_seconds, error_prefix="API"):
+def _parse_response_images(data, timeout_seconds, error_prefix="API",
+                           unique_id=None, n_expected=None):
     """Extract ComfyUI IMAGE tensors from an API response payload.
 
     Handles ``b64_json`` (decoded synchronously) and ``url`` entries
@@ -1111,11 +1381,13 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API"):
         data: Parsed JSON response dict.
         timeout_seconds: Read timeout forwarded to the async downloader.
         error_prefix: Context label for error messages (e.g. ``"gpt-image-2"``).
+        unique_id: Optional ComfyUI node ID for status-bar updates.
+        n_expected: Expected image count (for partial-failure warnings).
 
     Returns:
-        ``(torch.Tensor, list[str])`` — batched IMAGE tensor ``(N, H, W, 3)``
-        and the list of raw image URLs (empty when all images came from
-        ``b64_json``).
+        ``(torch.Tensor, list[str], int)`` — batched IMAGE tensor
+        ``(N, H, W, 3)``, list of raw image URLs, and count of
+        images that were expected but could not be retrieved.
 
     Raises:
         RuntimeError: If no images can be extracted.
@@ -1130,9 +1402,13 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API"):
     tensors = []
     b64_items = []
     url_items = []
+    b64_failed = 0
 
     for item in items:
         if not isinstance(item, dict):
+            _log("warn",
+                 f"{error_prefix} 响应包含非 dict 条目 (type={type(item).__name__})，"
+                 f"已跳过: {str(item)[:200]}")
             continue
         if item.get("b64_json"):
             b64_items.append(item["b64_json"])
@@ -1144,35 +1420,52 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API"):
         try:
             tensors.append(b64_json_to_uint8(b64))
         except Exception as exc:
-            print(
-                f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(b64_items)} 张图"
-                f" base64 解码失败，已跳过: {exc}"
-            )
+            b64_failed += 1
+            _log("warn",
+                 f"第 {idx+1}/{len(b64_items)} 张图 base64 解码失败，已跳过: {exc}")
 
     # URLs: download all concurrently, returns (tensors, successful_urls)
     successful_urls = []
     if url_items:
+        if unique_id:
+            emit_runtime_status(unique_id, "running",
+                                f"图片下载中 ({len(url_items)} 张)…",
+                                0, 0, 0, 0)
         url_tensors, successful_urls = _download_images_async(
             url_items, timeout_seconds)
         tensors.extend(url_tensors)
+        url_failed = len(url_items) - len(successful_urls)
+        if unique_id and url_failed > 0:
+            emit_runtime_status(unique_id, "running",
+                                f"下载完成: {len(tensors)} 张成功, "
+                                f"{b64_failed + url_failed} 张失败",
+                                0, 0, 0, 0)
+        elif unique_id:
+            emit_runtime_status(unique_id, "running",
+                                f"下载完成 ({len(tensors)} 张)",
+                                0, 0, 0, 0)
 
     if not tensors:
         raise RuntimeError(
             f"未能解析 {error_prefix} 响应图片: "
-            f"{json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]}"
+            f"{_safe_json_dumps(_sanitize_api_response(data))[:500]}"
         )
 
     # Batch GPU transfer + normalize in one pass
-    return _batch_uint8_to_image(tensors), successful_urls
+    failed = (len(items) - len(tensors)) + (b64_failed if not url_items else 0)
+    # Adjust failed count: items that were non-dict count as failed too
+    if n_expected is not None and len(tensors) < n_expected:
+        failed = n_expected - len(tensors)
+    return _batch_uint8_to_image(tensors), successful_urls, failed
 
 
 def _download_images_async(urls, timeout_seconds,
                            retry_times=DEFAULT_RETRY_TIMES):
     """Download multiple image URLs concurrently via ``asyncio.create_task()``.
 
-    All downloads share a single ``httpx.AsyncClient`` for HTTP/2
-    connection reuse.  PIL decoding is offloaded to :data:`_PIL_EXECUTOR`
-    so CPU work overlaps with remaining network I/O.
+    All downloads share a single ``httpx.AsyncClient`` for connection
+    reuse (HTTP/1.1 keepalive).  PIL decoding is offloaded to
+    :data:`_PIL_EXECUTOR` so CPU work overlaps with remaining network I/O.
 
     **Fault-tolerant**: individual image failures are logged and skipped;
     the batch continues as long as at least one image succeeds.
@@ -1194,7 +1487,7 @@ def _download_images_async(urls, timeout_seconds,
 
     """
     if not urls:
-        return []
+        return [], []
 
     _ACCEPT_HEADER = {
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -1215,6 +1508,9 @@ def _download_images_async(urls, timeout_seconds,
                 return response.content
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
+                _log("warn",
+                     f"图片下载失败 (attempt={attempt}/{retry_times}, "
+                     f"type={type(exc).__name__}): {last_error}")
                 if attempt < retry_times:
                     await asyncio.sleep(
                         _jittered_backoff_seconds(attempt))
@@ -1223,6 +1519,9 @@ def _download_images_async(urls, timeout_seconds,
             except httpx.HTTPStatusError as exc:
                 if is_retryable_http_status(exc.response.status_code):
                     last_error = str(exc)
+                    _log("warn",
+                         f"图片下载 HTTP {exc.response.status_code} "
+                         f"(attempt={attempt}/{retry_times}): {last_error}")
                     if attempt < retry_times:
                         await asyncio.sleep(
                             _jittered_backoff_seconds(attempt))
@@ -1245,10 +1544,11 @@ def _download_images_async(urls, timeout_seconds,
     async def _gather():
         req_timeout = ZHANGYUAPI_timeout(timeout_seconds)
         async with httpx.AsyncClient(
-            http2=True,
+            http2=False,
             timeout=req_timeout,
             trust_env=False,
             follow_redirects=True,
+            headers={"User-Agent": "Comfyui-ZhangyuAPI/3.0"},
         ) as client:
             tasks = [
                 asyncio.create_task(_download_and_decode(client, url))
@@ -1261,7 +1561,7 @@ def _download_images_async(urls, timeout_seconds,
         successful_urls = []
         failed_count = 0
         for idx, r in enumerate(results):
-            if isinstance(r, Exception):
+            if isinstance(r, BaseException):
                 failed_count += 1
                 print(
                     f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(urls)} 张图"
@@ -1301,8 +1601,7 @@ class ComfyuiZhangyuAPIImage2Node:
     Node display name: **Comfyui-ZhangyuAPI-image-2**
     """
 
-    MODELS = ["gpt-image-2"]
-    IMAGE_SIZES = ["auto (不传size)", "1K", "2K", "4K"]
+    IMAGE_SIZES = ["auto (不传size)", "ratio_only (仅传比例)", "1K", "2K", "4K"]
     ASPECT_RATIOS = [
         "AUTO", "1:1",
         "2:3", "3:2", "3:4", "4:5",
@@ -1311,7 +1610,7 @@ class ComfyuiZhangyuAPIImage2Node:
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = ("image", "response", "image_urls", "chats", "model_list")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-ZhangyuAPI/生图"
+    CATEGORY = "Comfyui-ZhangyuAPI/🖼️图片 Image"
 
     # ------------------------------------------------------------------
     # ComfyUI protocol methods
@@ -1340,7 +1639,7 @@ class ComfyuiZhangyuAPIImage2Node:
                 "api_base (接口域名)": (
                     "STRING", {"default": DEFAULT_API_BASE_URL, "multiline": False}),
                 "image_size (分辨率)": (
-                    cls.IMAGE_SIZES, {"default": "1K"}),
+                    cls.IMAGE_SIZES, {"default": "auto (不传size)"}),
                 "aspect_ratio (宽高比)": (
                     cls.ASPECT_RATIOS, {"default": "1:1"}),
                 "quality (画质)": (
@@ -1351,7 +1650,7 @@ class ComfyuiZhangyuAPIImage2Node:
                     ["png", "jpeg", "webp"], {"default": "jpeg"}),
                 "output_compression (压缩率)": (
                     "INT", {"default": 85, "min": 0, "max": 100}),
-                "seed (种子)": (
+                "seed (本地种子-不发送API)": (
                     "INT", {
                         "default": 0, "min": 0, "max": 2147483647,
                         "control_after_generate": True,
@@ -1368,8 +1667,15 @@ class ComfyuiZhangyuAPIImage2Node:
             "optional": {
                 **{f"image_{i:02d}": ("IMAGE",) for i in range(1, 9)},
                 "mask": ("MASK",),
+                "llm_model (反推用LLM模型)": (
+                    "STRING", {"default": "gpt-5.5",
+                               "multiline": False,
+                               "placeholder": "prompt 留空时自动用此模型反推"}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
         }
 
     @classmethod
@@ -1403,7 +1709,16 @@ class ComfyuiZhangyuAPIImage2Node:
             tensor = kwargs.get(f"image_{i:02d}")
             if tensor is None:
                 continue
+            tensor = _auto_downscale(tensor)
             png_bytes = tensor_to_png_bytes(tensor)
+            # If PNG exceeds the API's 1024 KB part limit, keep halving
+            # dimensions until it fits (with 10 % safety margin).
+            while len(png_bytes) > 900 * 1024:
+                h, w = tensor.shape[1], tensor.shape[2]
+                if h <= 64 or w <= 64:
+                    break  # already tiny — give up
+                tensor = _auto_downscale(tensor, max_total_pixels=(h * w) // 4)
+                png_bytes = tensor_to_png_bytes(tensor)
             image_payloads.append(
                 (f"image_{i:02d}.png", png_bytes)
             )
@@ -1414,7 +1729,7 @@ class ComfyuiZhangyuAPIImage2Node:
 
     def _payload_fields(self, model, prompt, size, quality, response_format,
                         output_format, output_compression, n_images,
-                        init_images=None):
+                        init_images=None, aspect_ratio=None):
         """Build the JSON payload fields for an Images API request.
 
         Only includes non-default values to keep the request minimal.
@@ -1422,7 +1737,8 @@ class ComfyuiZhangyuAPIImage2Node:
         Args:
             model: Model ID string.
             prompt: Cleaned prompt text.
-            size: Resolved size string (``"WxH"`` or ``"auto"``).
+            size: Resolved size string (``"WxH"`` or ``"auto"``) or
+                ``"ratio:<W:H>"`` sentinel for ratio-only mode.
             quality: One of ``"auto"``, ``"low"``, ``"medium"``, ``"high"``.
             response_format: ``"url"`` or ``"b64_json"``.
             output_format: ``"png"``, ``"jpeg"``, or ``"webp"``.
@@ -1436,14 +1752,24 @@ class ComfyuiZhangyuAPIImage2Node:
 
         """
         fields = {"model": model, "prompt": prompt, "n": n_images}
-        if size != "auto":
+        if isinstance(size, str) and size.startswith("ratio:"):
+            # Ratio-only mode: send aspect_ratio instead of concrete size.
+            # "ratio:AUTO" means let the API decide — don't send any hint.
+            ratio_val = size[6:]  # strip "ratio:" prefix
+            if ratio_val and ratio_val.upper() != "AUTO":
+                fields["aspect_ratio"] = ratio_val
+        elif size != "auto":
             fields["size"] = size
         if quality != "auto":
             fields["quality"] = quality
         if response_format != "b64_json":
             fields["response_format"] = response_format
-        if output_format != "png":
-            fields["output_format"] = output_format
+        # output format + compression
+        fields["output_format"] = output_format
+        if output_format == "png":
+            # PNG is lossless — force compression to 100 regardless of widget
+            fields["output_compression"] = 100
+        else:
             fields["output_compression"] = output_compression
         if init_images:
             fields["init_images"] = init_images
@@ -1500,8 +1826,12 @@ class ComfyuiZhangyuAPIImage2Node:
 
         data = {}
         for key, value in fields.items():
+            if value is None:
+                continue
             if isinstance(value, list):
                 data[key] = json.dumps(value, ensure_ascii=False)
+            elif isinstance(value, (int, float, bool)):
+                data[key] = value
             else:
                 data[key] = str(value)
         return ZHANGYUAPI_post(
@@ -1523,6 +1853,25 @@ class ComfyuiZhangyuAPIImage2Node:
     # ------------------------------------------------------------------
 
     def generate(self, **kwargs):
+        """Thin wrapper: delegates to :meth:`_generate_impl` with ``skip_error``
+        handling so the workflow can continue on failure.
+        """
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._generate_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
+            return _skip_error_return(
+                error_msg, self.RETURN_TYPES,
+                unique_id=kwargs.get("unique_id"),
+                retry_times=kwargs.get("retry_times (重试次数)", 3),
+                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 360),
+            )
+
+    def _generate_impl(self, **kwargs):
         """Execute a gpt-image-2 generation or edit request.
 
         ComfyUI calls this method from a thread-pool executor.  The method:
@@ -1537,7 +1886,8 @@ class ComfyuiZhangyuAPIImage2Node:
             **kwargs: ComfyUI widget values keyed by display name.
 
         Returns:
-            ``tuple[torch.Tensor, str]`` — ``(image, response_json)``.
+            ``tuple[torch.Tensor, str, str, str, str]`` —
+            ``(image, response, image_urls, api_response, model_list)``.
 
         Raises:
             ValueError: On missing / invalid inputs.
@@ -1545,6 +1895,7 @@ class ComfyuiZhangyuAPIImage2Node:
                 of retry attempts.
 
         """
+        pbar = ProgressBar(100) if ProgressBar else None
         # -- sanitize inputs --------------------------------------------------
         api_key = kwargs.get("api_key (API密钥)", "")
         prompt = kwargs.get("prompt (提示词)", "")
@@ -1557,7 +1908,7 @@ class ComfyuiZhangyuAPIImage2Node:
         image_size = kwargs.get(
             "image_size (分辨率)",
             kwargs.get("size_ratio (尺寸/比例)",
-                       kwargs.get("size (尺寸)", "1K")),
+                       kwargs.get("size (尺寸)", "auto (不传size)")),
         )
         aspect_ratio = kwargs.get("aspect_ratio (宽高比)", "1:1")
         quality = safe_choice(
@@ -1571,7 +1922,10 @@ class ComfyuiZhangyuAPIImage2Node:
             ["png", "jpeg", "webp"], "jpeg")
         output_compression = safe_int(
             kwargs.get("output_compression (压缩率)", 85), 85, 0, 100)
-        seed = safe_int(kwargs.get("seed (种子)", 0), 0, 0, 2147483647)
+        seed = safe_int(
+            kwargs.get("seed (本地种子-不发送API)",
+                       kwargs.get("seed (种子)", 0)),
+            0, 0, 2147483647)
         timeout_seconds = safe_int(
             kwargs.get("timeout_seconds (超时秒数)", DEFAULT_NODE_TIMEOUT),
             DEFAULT_NODE_TIMEOUT,
@@ -1590,12 +1944,86 @@ class ComfyuiZhangyuAPIImage2Node:
                                 0.0, 0, retry_times, timeout_seconds)
             raise ValueError("API Key 不能为空")
 
+        # Collect images early — needed for auto-prompt fallback
+        image_payloads, init_images = self._collect_images(kwargs)
+
         clean_prompt = normalize_prompt_text(prompt)
+        if not clean_prompt and image_payloads:
+            # Auto-generate prompt from reference images via LLM vision
+            emit_runtime_status(unique_id, "running", "正在反推提示词…",
+                                0.0, 0, retry_times, timeout_seconds)
+            if pbar: pbar.update_absolute(5)
+            try:
+                # Use the first image as reference for prompt generation
+                ref_url = init_images[0] if init_images else None
+                if ref_url:
+                    messages = [
+                        {"role": "system",
+                         "content": (
+                             "你是专业图像提示词生成器。请基于用户提供的参考图片"
+                             "反推提示词，生成标准 JSON 格式的绘画提示词：\n"
+                             "核心还原：完整覆盖主体形象、构图视角、画面风格、"
+                             "光影效果、画幅比例、场景环境、人物姿势、服饰发型、"
+                             "配饰道具、材质纹理、摄影器材与焦段等全部关键视觉要素，"
+                             "保障主体辨识度与画面结构高度还原\n"
+                             "创意优化：在保留原图整体调性与核心特征的前提下，"
+                             "对背景细节、光影层次、色彩氛围做适度创意升级，"
+                             "不改变主体核心形态\n"
+                             "输出规则：仅输出纯 JSON 文本，不添加任何解释、备注、"
+                             "标签与多余话术，提示词总字数控制在 350 字以内"
+                         )},
+                        {"role": "user",
+                         "content": [
+                             {"type": "image_url",
+                              "image_url": {"url": ref_url, "detail": "high"}},
+                             {"type": "text",
+                              "text": "请根据这张参考图反推一个图像生成用的提示词"},
+                         ]},
+                    ]
+                    generated, _ = _call_chat_simple(
+                        api_base, api_key.strip(),
+                        kwargs.get("llm_model (反推用LLM模型)") or "gpt-5.5",
+                        messages,
+                        timeout_seconds=timeout_seconds,
+                        temperature=0.7, max_tokens=512,
+                        retry_times=retry_times,
+                    )
+                    # Strip markdown code fences before JSON parse (LLMs
+                    # often wrap JSON in ```json ... ``` blocks)
+                    clean_generated = generated.strip()
+                    for fence in ("```json", "```"):
+                        if clean_generated.startswith(fence):
+                            clean_generated = clean_generated[len(fence):].lstrip("\n")
+                        if clean_generated.endswith("```"):
+                            clean_generated = clean_generated[:-3].rstrip("\n")
+                    # Try JSON parse first; fall back to raw text
+                    try:
+                        parsed = json.loads(clean_generated)
+                        if isinstance(parsed, dict):
+                            clean_prompt = normalize_prompt_text(
+                                parsed.get("prompt") or parsed.get("提示词") or "")
+                        elif isinstance(parsed, str):
+                            clean_prompt = normalize_prompt_text(parsed)
+                        else:
+                            clean_prompt = normalize_prompt_text(generated)
+                    except (json.JSONDecodeError, ValueError):
+                        clean_prompt = normalize_prompt_text(generated)
+                    _log("info", f"自动反推提示词: {clean_prompt[:200]}")
+            except Exception as exc:
+                _log("warn", f"自动反推提示词失败: {exc}")
+                # Fall through — will raise below if prompt is still empty
+
         if not clean_prompt:
+            emit_runtime_status(unique_id, "error", "prompt 不能为空",
+                                0.0, 0, retry_times, timeout_seconds)
             raise ValueError("prompt 不能为空")
 
-        effective_size = normalize_size(image_size, aspect_ratio)
-        image_payloads, init_images = self._collect_images(kwargs)
+        try:
+            effective_size = normalize_size(image_size, aspect_ratio)
+        except ValueError as exc:
+            emit_runtime_status(unique_id, "error", str(exc),
+                                0.0, 0, retry_times, timeout_seconds)
+            raise
         mask_bytes = mask_to_png_bytes(kwargs.get("mask"))
 
         if mode == "AUTO":
@@ -1609,6 +2037,9 @@ class ComfyuiZhangyuAPIImage2Node:
                                 0.0, 0, retry_times, timeout_seconds)
             raise ValueError("img2img 模式需要至少一张参考图")
         if mask_bytes is not None and not image_payloads:
+            emit_runtime_status(unique_id, "error",
+                                "mask 只能和 image_01 一起用于图片编辑",
+                                0.0, 0, retry_times, timeout_seconds)
             raise ValueError("mask 只能和 image_01 一起用于图片编辑")
 
         # -- prepare request --------------------------------------------------
@@ -1617,6 +2048,7 @@ class ComfyuiZhangyuAPIImage2Node:
             model, clean_prompt, effective_size,
             quality, response_format, output_format, output_compression,
             n_images, init_images=init_images,
+            aspect_ratio=aspect_ratio,
         )
 
         print(
@@ -1626,6 +2058,7 @@ class ComfyuiZhangyuAPIImage2Node:
         )
         emit_runtime_status(unique_id, "running", "开始生成",
                             0.0, 0, retry_times, timeout_seconds)
+        if pbar: pbar.update_absolute(10)
 
         # -- fetch model list for output port (best-effort) --------------------
         model_list = []
@@ -1659,8 +2092,25 @@ class ComfyuiZhangyuAPIImage2Node:
                     )
 
                 if response.status_code != 200:
+                    # Clear, immediately-failed messages for common client errors
+                    if response.status_code == 401:
+                        raise RuntimeError(
+                            "API Key 无效 (401 Unauthorized)，"
+                            "请检查 API 密钥是否正确"
+                        )
+                    if response.status_code == 403:
+                        raise RuntimeError(
+                            "API 访问被拒绝 (403 Forbidden)，"
+                            "请检查账户权限或余额"
+                        )
+
+                    try:
+                        err_data = response.json()
+                        err_msg = _extract_api_error_message(err_data)
+                    except Exception:
+                        err_msg = response.text[:500]
                     last_error = (
-                        f"API 错误 {response.status_code}: {response.text[:500]}"
+                        f"API 错误 {response.status_code}: {err_msg}"
                     )
                     if (is_retryable_http_status(response.status_code)
                             and attempt < retry_times):
@@ -1676,6 +2126,7 @@ class ComfyuiZhangyuAPIImage2Node:
                     raise RuntimeError(last_error)
 
                 data = response.json()
+                if pbar: pbar.update_absolute(50)
 
                 # If API returned an async task, poll with adaptive intervals
                 if is_async_task_response(data):
@@ -1704,48 +2155,60 @@ class ComfyuiZhangyuAPIImage2Node:
                     )
 
                 # Parse images from the (possibly polled) response
-                image_tensor, image_urls = _parse_response_images(
-                    data, timeout_seconds, error_prefix="gpt-image-2")
+                image_tensor, image_urls, _failed = _parse_response_images(
+                    data, timeout_seconds, error_prefix="gpt-image-2",
+                    unique_id=unique_id, n_expected=n_images)
+                if pbar: pbar.update_absolute(90)
                 elapsed = time.time() - start_ts
 
-                response_info = {
-                    "status": "success",
-                    "model": model,
-                    "mode": actual_mode,
-                    "api_base": denormalize_api_base(api_base),
-                    "image_size": image_size,
-                    "aspect_ratio": aspect_ratio,
-                    "resolved_size": effective_size,
-                    "request_fields": _strip_image_data(fields),
-                    "input_images": len(image_payloads),
-                    "mask": mask_bytes is not None,
-                    "output_images": int(image_tensor.shape[0]),
-                    "image_urls": image_urls,
-                    "usage": data.get("usage"),
-                    "seed": seed,
-                    "seed_note": (
-                        "seed is a ComfyUI control only and is not sent "
-                        "to gpt-image-2"
-                    ),
-                    "elapsed_seconds": round(elapsed, 2),
-                }
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                response_info = (
+                    f"## ZhangyuAPI 生成结果 ({timestamp})\n\n"
+                    f"- **模型**：{model}\n"
+                    f"- **模式**：{actual_mode}\n"
+                    f"- **接口**：{denormalize_api_base(api_base)}\n"
+                    f"- **分辨率**：{image_size}"
+                    + (f" → {effective_size}" if effective_size != image_size else "") + "\n"
+                    f"- **宽高比**：{aspect_ratio}\n"
+                    f"- **画质**：{quality}\n"
+                    f"- **输出格式**：{output_format}"
+                    + (f" (压缩率 {output_compression})" if output_format != "png" else "") + "\n"
+                    f"- **生成数量**：{n_images} 张\n"
+                    f"- **成功**：{int(image_tensor.shape[0])} 张\n"
+                    + (f"- **失败**：{_failed} 张\n"
+                       f"- **警告**：请求 {n_images} 张，{_failed} 张下载/解码失败\n"
+                       if _failed else "")
+                    + (f"- **参考图**：{len(image_payloads)} 张\n" if image_payloads else "")
+                    + (f"- **遮罩**：是\n" if mask_bytes is not None else "")
+                    + (f"- **种子**：{seed} (仅本地，不发送 API)\n"
+                       if seed else "")
+                    + (f"- **耗时**：{elapsed:.1f}s (attempt {attempt}/{retry_times})\n"
+                       f"- **Usage**：{data.get('usage')}\n"
+                       if data.get("usage") else "")
+                )
 
                 emit_runtime_status(
                     unique_id, "success",
-                    f"生成成功 (耗时 {elapsed:.1f}s)",
+                    f"生成成功 (耗时 {elapsed:.1f}s)"
+                    + (f"，{_failed} 张失败" if _failed else ""),
                     elapsed, attempt, retry_times, timeout_seconds,
                 )
+                if pbar: pbar.update_absolute(100)
                 return (
                     image_tensor,
-                    json.dumps(response_info, ensure_ascii=False, indent=2),
-                    json.dumps(image_urls, ensure_ascii=False),
-                    json.dumps(_sanitize_api_response(data), ensure_ascii=False, indent=2),
-                    json.dumps(model_list, ensure_ascii=False),
+                    response_info,
+                    _safe_json_dumps(image_urls),
+                    _safe_json_dumps(_sanitize_api_response(data), indent=2),
+                    _safe_json_dumps(model_list),
                 )
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
+                _log("warn",
+                     f"Image-2 生成失败 (attempt={attempt}/{retry_times}, "
+                     f"type={type(exc).__name__}): {last_error}")
                 if attempt < retry_times:
+                    _on_retryable_error(exc)
                     emit_runtime_status(
                         unique_id, "running",
                         f"网络/代理/超时，重试中 ({attempt}/{retry_times})",

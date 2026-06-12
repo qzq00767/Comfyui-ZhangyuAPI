@@ -31,12 +31,14 @@ from .zhangyu_gpt_img2 import (
     denormalize_api_base,
     b64_json_to_uint8,
     tensor_to_data_url,
+    _auto_downscale,
     emit_runtime_status,
     safe_int,
     safe_float,
     safe_choice,
     normalize_prompt_text,
     _log,
+    _skip_error_return,
 )
 
 DEFAULT_GEMINI_BASE = "https://zhangyuapi.com"
@@ -208,7 +210,7 @@ class ComfyuiZhangyuAPIGeminiNode:
     RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING")
     RETURN_NAMES = ("image", "response", "chats", "model_list")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-ZhangyuAPI/生图"
+    CATEGORY = "Comfyui-ZhangyuAPI/🖼️图片 Image"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -225,7 +227,7 @@ class ComfyuiZhangyuAPIGeminiNode:
                 "api_base (接口域名)": (
                     "STRING", {"default": DEFAULT_GEMINI_BASE, "multiline": False}),
                 "image_size (分辨率)": (
-                    cls.IMAGE_SIZES, {"default": "1K"}),
+                    cls.IMAGE_SIZES, {"default": "auto (不传size)"}),
                 "aspect_ratio (宽高比)": (
                     cls.ASPECT_RATIOS, {"default": "1:1"}),
                 "n (生成数量)": (
@@ -248,7 +250,10 @@ class ComfyuiZhangyuAPIGeminiNode:
                     cls.OUTPUT_FORMATS, {"default": "jpeg"}),
                 **{f"image_{i:02d}": ("IMAGE",) for i in range(1, 9)},
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
         }
 
     @classmethod
@@ -278,17 +283,35 @@ class ComfyuiZhangyuAPIGeminiNode:
             tensor = kwargs.get(f"image_{i:02d}")
             if tensor is None:
                 continue
+            tensor = _auto_downscale(tensor)
             data_urls.append(tensor_to_data_url(tensor))
         return data_urls
 
     def generate(self, **kwargs):
+        """Thin wrapper with ``skip_error`` handling for workflow continuity."""
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._generate_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
+            return _skip_error_return(
+                error_msg, self.RETURN_TYPES,
+                unique_id=kwargs.get("unique_id"),
+                retry_times=kwargs.get("retry_times (重试次数)", 3),
+                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 360),
+            )
+
+    def _generate_impl(self, **kwargs):
         api_key = kwargs.get("api_key (API密钥)", "").strip()
         api_base = normalize_api_base(
             kwargs.get("api_base (接口域名)", DEFAULT_GEMINI_BASE))
         prompt = kwargs.get("prompt (提示词)", "")
         model = kwargs.get("model (模型)", "").strip()
         image_size = safe_choice(
-            kwargs.get("image_size (分辨率)", "1K"),
+            kwargs.get("image_size (分辨率)", "auto (不传size)"),
             self.IMAGE_SIZES, "1K")
         aspect_ratio = safe_choice(
             kwargs.get("aspect_ratio (宽高比)", "1:1"),

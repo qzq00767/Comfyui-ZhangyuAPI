@@ -42,22 +42,17 @@ from .zhangyu_gpt_img2 import (
     emit_runtime_status,
     # Model list (output port only, no validation)
     _sanitize_api_response,
+    _skip_error_return,
     _extract_api_error_message,
     _filter_models_by_patterns,
     fetch_available_models_cached,
     # Image conversion
     tensor_to_data_url,
+    _auto_downscale,
     # Logging
     _log,
     # Constants
     DEFAULT_API_BASE_URL,
-    DEFAULT_NODE_TIMEOUT,
-    DEFAULT_MIN_NODE_TIMEOUT,
-    DEFAULT_MAX_NODE_TIMEOUT,
-    DEFAULT_RETRY_TIMES,
-    DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_READ_TIMEOUT,
-    DEFAULT_POOL_TIMEOUT,
 )
 
 # ---------------------------------------------------------------------------
@@ -172,7 +167,7 @@ class ComfyuiZhangyuAPISoraNode:
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
     RETURN_NAMES = ("video", "response", "model_list")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-ZhangyuAPI/视频"
+    CATEGORY = "Comfyui-ZhangyuAPI/🎬视频 Video"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -211,7 +206,10 @@ class ComfyuiZhangyuAPISoraNode:
                     "INT", {"default": 1, "min": 1, "max": 4}),
                 "image_01 (参考图)": ("IMAGE",),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
         }
 
     @classmethod
@@ -423,6 +421,23 @@ class ComfyuiZhangyuAPISoraNode:
     # ------------------------------------------------------------------
 
     def generate(self, **kwargs):
+        """Thin wrapper with ``skip_error`` handling."""
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._generate_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
+            return _skip_error_return(
+                error_msg, self.RETURN_TYPES,
+                unique_id=kwargs.get("unique_id"),
+                retry_times=kwargs.get("retry_times (重试次数)", 3),
+                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 600),
+            )
+
+    def _generate_impl(self, **kwargs):
         """Execute a Sora-format video generation request.
 
         1. Validates and sanitizes all inputs.
@@ -468,6 +483,7 @@ class ComfyuiZhangyuAPISoraNode:
         image_data_url = None
         image_tensor = kwargs.get("image_01 (参考图)")
         if image_tensor is not None:
+            image_tensor = _auto_downscale(image_tensor)
             image_data_url = tensor_to_data_url(image_tensor)
 
         # -- validate ---------------------------------------------------------

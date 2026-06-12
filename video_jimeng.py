@@ -14,6 +14,7 @@ Comfyui-ZhangyuAPI — 即梦格式视频生成节点.
 Auth: ``Authorization: Bearer <api_key>``.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -36,11 +37,13 @@ from .zhangyu_gpt_img2 import (
     _download_bytes_with_retry,
     emit_runtime_status,
     _sanitize_api_response,
+    _skip_error_return,
     _extract_api_error_message,
     _filter_models_by_patterns,
     fetch_available_models_cached,
     tensor_to_data_url,
     tensor_to_png_bytes,
+    _auto_downscale,
     _log,
     DEFAULT_API_BASE_URL,
 )
@@ -104,7 +107,7 @@ class ComfyuiZhangyuAPIJimengNode:
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
     RETURN_NAMES = ("video", "response", "model_list")
     FUNCTION = "generate"
-    CATEGORY = "Comfyui-ZhangyuAPI/视频"
+    CATEGORY = "Comfyui-ZhangyuAPI/🎬视频 Video"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -143,7 +146,10 @@ class ComfyuiZhangyuAPIJimengNode:
                     "INT", {"default": 24, "min": 1, "max": 120}),
                 **{f"image_{i:02d} (参考图{i})": ("IMAGE",) for i in range(1, 5)},
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
         }
 
     @classmethod
@@ -173,13 +179,12 @@ class ComfyuiZhangyuAPIJimengNode:
             ``list[str]`` — pure base64-encoded PNG data (for
             ``binary_data_base64`` array).
         """
-        import base64
-
         images = []
         for i in range(1, 5):
             tensor = kwargs.get(f"image_{i:02d} (参考图{i})")
             if tensor is None:
                 continue
+            tensor = _auto_downscale(tensor)
             png_bytes = tensor_to_png_bytes(tensor)
             images.append(base64.b64encode(png_bytes).decode("utf-8"))
         return images
@@ -407,6 +412,23 @@ class ComfyuiZhangyuAPIJimengNode:
     # ------------------------------------------------------------------
 
     def generate(self, **kwargs):
+        """Thin wrapper with ``skip_error`` handling."""
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._generate_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
+            return _skip_error_return(
+                error_msg, self.RETURN_TYPES,
+                unique_id=kwargs.get("unique_id"),
+                retry_times=kwargs.get("retry_times (重试次数)", 3),
+                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 600),
+            )
+
+    def _generate_impl(self, **kwargs):
         """Execute a Jimeng-format video generation request.
 
         Returns:

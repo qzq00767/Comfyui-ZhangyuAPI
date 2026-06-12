@@ -37,6 +37,9 @@ from .zhangyu_gpt_img2 import (
     fetch_available_models_cached,
     _filter_chat_models,
     _log,
+    _on_retryable_error,
+    _skip_error_return,
+    safe_int,
 )
 
 
@@ -44,7 +47,7 @@ from .zhangyu_gpt_img2 import (
 # Constants
 # ===================================================================
 
-CATEGORY = "Comfyui-ZhangyuAPI/文本"
+CATEGORY = "Comfyui-ZhangyuAPI/📝文本 Text"
 
 _REFERENCE_MODE_MAP = {
     "自动判断": "auto",
@@ -364,7 +367,11 @@ def _call_chat_with_retry(api_base, api_key, model, messages,
             )
         except _RETRYABLE_EXCEPTIONS as exc:
             last_error = str(exc)
+            _log("warn",
+                 f"LLM 调用失败 (attempt={attempt}/{retry_times}, "
+                 f"type={type(exc).__name__}): {last_error}")
             if attempt < retry_times:
+                _on_retryable_error(exc)
                 _jittered_sleep(attempt)
                 continue
             break
@@ -604,7 +611,10 @@ class ZhangyuAPIPromptOptimizer:
                 "retry_times (重试)": (
                     "INT", {"default": 2, "min": 1, "max": 5}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
         }
 
     @classmethod
@@ -805,6 +815,23 @@ class ZhangyuAPIPromptOptimizer:
     # ------------------------------------------------------------------
 
     def optimize(self, **kwargs):
+        """Thin wrapper with ``skip_error`` handling for workflow continuity."""
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._optimize_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
+            return _skip_error_return(
+                error_msg, self.RETURN_TYPES,
+                unique_id=kwargs.get("unique_id"),
+                retry_times=kwargs.get("retry_times (重试次数)", 2),
+                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 600),
+            )
+
+    def _optimize_impl(self, **kwargs):
         """Main entry point — auto-detects mode and runs optimisation.
 
         Args:
@@ -1087,13 +1114,106 @@ except Exception as exc:
 # ===================================================================
 # ComfyUI node registration
 # ===================================================================
+# 节点：中译英翻译
+# ===================================================================
+
+class ZhangyuAPITranslateNode:
+    """将中文提示词翻译为英文，适配对英文响应更好的生图模型。
+
+    Node display name: **ComfyUI-zhangyuapi-中译英**
+    """
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt_en",)
+    FUNCTION = "translate"
+    CATEGORY = "Comfyui-ZhangyuAPI/🔧工具 Tools"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key (API密钥)": (
+                    "STRING", {"default": "", "multiline": False}),
+                "prompt_cn (中文提示词)": (
+                    "STRING", {"multiline": True, "default": ""}),
+                "model (模型)": (
+                    "STRING", {"default": "deepseek-v4-pro",
+                               "multiline": False}),
+                "api_base (接口域名)": (
+                    "STRING", {"default": DEFAULT_API_BASE_URL,
+                               "multiline": False}),
+                "timeout_seconds (超时秒数)": (
+                    "INT", {"default": 120, "min": 30, "max": 600}),
+                "retry_times (重试次数)": (
+                    "INT", {"default": 2, "min": 1, "max": 5}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "skip_error": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    def translate(self, **kwargs):
+        skip_error = kwargs.get("skip_error", False)
+        try:
+            return self._translate_impl(**kwargs)
+        except Exception as exc:
+            if not skip_error:
+                raise
+            error_msg = f"{type(exc).__name__}: {exc}"
+            _log("warn", f"skip_error 模式，翻译节点失败: {error_msg}")
+            return (f"skip_error: {error_msg}",)
+
+    def _translate_impl(self, **kwargs):
+        api_key = kwargs.get("api_key (API密钥)", "").strip()
+        prompt_cn = kwargs.get("prompt_cn (中文提示词)", "").strip()
+        model = (kwargs.get("model (模型)") or "").strip() or "deepseek-v4-pro"
+        api_base = normalize_api_base(
+            kwargs.get("api_base (接口域名)", DEFAULT_API_BASE_URL))
+        timeout_seconds = safe_int(
+            kwargs.get("timeout_seconds (超时秒数)", 120), 120, 30, 600)
+        retry_times = safe_int(
+            kwargs.get("retry_times (重试次数)", 2), 2, 1, 5)
+        unique_id = kwargs.get("unique_id")
+
+        if not prompt_cn:
+            return ("",)
+        if not api_key:
+            emit_runtime_status(unique_id, "error", "API Key 为空",
+                                0, 0, retry_times, timeout_seconds)
+            raise ValueError("API Key 不能为空")
+
+        emit_runtime_status(unique_id, "running", "翻译中…",
+                            0, 0, retry_times, timeout_seconds)
+
+        messages = [
+            {"role": "system",
+             "content": (
+                 "你是一个专业的图像提示词翻译器。"
+                 "将用户输入的中文提示词翻译成自然流畅的英文。"
+                 "保持原意和细节，不添加不删减。"
+                 "只输出翻译结果，不要加任何解释或注释。"
+             )},
+            {"role": "user", "content": prompt_cn},
+        ]
+        result, _ = _call_chat_with_retry(
+            api_base, api_key, model, messages,
+            timeout_seconds=timeout_seconds, stream=False, temperature=0.3,
+            max_tokens=1024, retry_times=retry_times,
+        )
+        return (result.strip(),)
+
+
+# ===================================================================
 
 NODE_CLASS_MAPPINGS = {
     "ZhangyuAPIPromptOptimizer": ZhangyuAPIPromptOptimizer,
     "ZhangyuAPITextListEditor": ZhangyuAPITextListEditor,
+    "ZhangyuAPITranslateNode": ZhangyuAPITranslateNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ZhangyuAPIPromptOptimizer": "ComfyUI-zhangyuapi-提示词优化器",
     "ZhangyuAPITextListEditor": "ComfyUI-zhangyuapi-文本停留编辑器",
+    "ZhangyuAPITranslateNode": "ComfyUI-zhangyuapi-中译英",
 }
