@@ -51,6 +51,8 @@ from .zhangyu_gpt_img2 import (
     _filter_image_models,
     fetch_available_models_cached,
     emit_runtime_status,
+    _safe_extract_error_from_response,
+    _on_retryable_error,
 )
 
 
@@ -361,7 +363,7 @@ class ComfyuiZhangyuAPIUniversalImageNode:
                         err_data = response.json()
                         err_msg = _extract_api_error_message(err_data)
                     except Exception:
-                        err_msg = response.text[:500]
+                        err_msg = _safe_extract_error_from_response(response)
                     last_error = f"API 错误 {response.status_code}: {err_msg}"
                     if (is_retryable_http_status(response.status_code)
                             and attempt < retry_times):
@@ -451,6 +453,8 @@ class ComfyuiZhangyuAPIUniversalImageNode:
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
+                # 始终调用_on_retryable_error来处理连接重置
+                _on_retryable_error(exc)
                 if attempt < retry_times:
                     emit_runtime_status(
                         unique_id, "running",

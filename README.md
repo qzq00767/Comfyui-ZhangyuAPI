@@ -4,7 +4,7 @@ ComfyUI 自定义节点，对接 **zhangyuapi.com** — 它允许你在 ComfyUI 
 
 ## 📖 简介
 
-Comfyui-ZhangyuAPI 提供 **8 个节点**，覆盖从"想生成什么"到"怎么生成"的完整链路——提示词优化 → 生图（GPT-Image-2 / OpenAI / Gemini）→ 视频生成（Sora / Kling / 即梦）→ 文本编辑。所有节点通过 REST API 通信，支持 HTTP/2 直连、自适应轮询和自动重试。
+Comfyui-ZhangyuAPI 提供 **9 个节点**，覆盖从"想生成什么"到"怎么生成"的完整链路——提示词优化 → 生图（GPT-Image-2 / OpenAI / Gemini）→ 视频生成（Sora / Kling / 即梦）→ 文本编辑 → 中译英翻译。所有节点通过 REST API 通信，支持 HTTP/2 直连、自适应轮询和自动重试。
 
 **核心亮点：**
 
@@ -16,6 +16,7 @@ Comfyui-ZhangyuAPI 提供 **8 个节点**，覆盖从"想生成什么"到"怎么
 - ✅ **即梦格式视频** — 支持 `CVSync2Async` 提交流程
 - ✅ **提示词优化** — LLM 根据用户需求自动生成结构化生图提示词
 - ✅ **文本停留编辑** — 工作流执行中暂停，手动编辑文本后继续
+- ✅ **中译英翻译** — 中文提示词 → 英文，适配英文响应更好的模型
 
 ## ✨ 特性
 
@@ -23,13 +24,13 @@ Comfyui-ZhangyuAPI 提供 **8 个节点**，覆盖从"想生成什么"到"怎么
 |------|------|
 | 通用兼容 | 兼容 OpenAI、Sora、Kling、Jimeng、Gemini 多种 API 协议格式 |
 | 异步轮询 | API 返回任务 ID 后自动自适应轮询（1s → 3s → 8s → 15s），最多等待超时上限 |
-| HTTP/2 直连 | 强制直连绕过系统代理，低延迟高吞吐 |
 | 多图输出 | 支持一次生成多张图片（n 参数，最多 10 张） |
 | 多图输入 | 图生图模式支持最多 8 张参考图 + mask 遮罩 |
 | 灵活参数 | 支持 model、size、quality、aspect_ratio、output_format、seed、steps、cfg_scale 等 |
 | 模型感知校验 | 自动检测模型家族（GPT / DALL-E / SD / FLUX / Midjourney），适配合法参数 |
 | 进度条 | 前端实时显示生成进度，自适应曲线加速感知 |
 | 自动重试 | 408 / 429 / 5xx 自动退避重试 |
+| 中译英翻译 | 中文提示词 → 英文，适配英文响应更好的生图模型 |
 
 ## 🔧 安装
 
@@ -46,7 +47,7 @@ pip install -r requirements.txt
 
 ## 🎮 节点说明
 
-### 总览（8 个节点）
+### 总览（9 个节点）
 
 | 节点 | 分类 | 协议 | 说明 |
 |------|------|------|------|
@@ -58,6 +59,7 @@ pip install -r requirements.txt
 | `ComfyUI-zhangyuapi-即梦格式` | 视频 | Jimeng | 即梦 `CVSync2Async` 视频生成 |
 | `ComfyUI-zhangyuapi-提示词优化器` | 文本 | OpenAI | 文字需求 → 结构化生图提示词，支持参考图模式 |
 | `ComfyUI-zhangyuapi-文本停留编辑器` | 文本 | — | 工作流执行中暂停，手动编辑文本后继续 |
+| `ComfyUI-zhangyuapi-中译英` | 工具 | LLM | 中文提示词 → 英文，适配英文响应更好的模型 |
 
 ---
 
@@ -248,6 +250,20 @@ pip install -r requirements.txt
 
 工作流执行到该节点时暂停，弹出编辑器让用户手动修改文本，确认后继续执行。适合需要人工审核或调整中间文本的场景。
 
+---
+
+### ComfyUI-zhangyuapi-中译英
+
+将中文提示词翻译为英文，适配对英文响应更好的生图模型。支持自定义模型选择，可与其他节点组合使用。
+
+| 关键参数 | 说明 |
+|----------|------|
+| `prompt_cn (中文提示词)` | 中文描述 |
+| `model (模型)` | LLM 模型选择 |
+| `api_base (接口域名)` | API 基础地址 |
+
+**输出**：`prompt_en`（英文提示词）
+
 ## 📋 工作流示例
 
 ### 文生图
@@ -275,6 +291,15 @@ pip install -r requirements.txt
 ```
 
 通过 `generateContent` 协议调用 Gemini 模型生图，支持图生图参考。
+
+### 中译英 + 生图
+
+```
+[中译英翻译] → [Image-2 生图] → [Save Image]
+```
+
+1. 中译英节点将中文提示词翻译为英文
+2. 英文提示词送入生图节点生成图片
 
 ### 视频生成
 
@@ -311,6 +336,7 @@ pip install -r requirements.txt
 | `/jimeng/?Action=CVSync2AsyncSubmitTask` | POST | 即梦提交任务 | 即梦格式 |
 | `/jimeng/?Action=CVSync2AsyncGetResult` | POST | 即梦查询结果 | 即梦格式 |
 | `/v1/chat/completions` | POST | 提示词优化（LLM） | 提示词优化器 |
+| `/v1/chat/completions` | POST | 中译英翻译（LLM） | 中译英 |
 
 鉴权格式：`Authorization: Bearer YOUR_API_KEY`
 
@@ -320,6 +346,7 @@ pip install -r requirements.txt
 用户输入 → INPUT_TYPES 校验 → generate()
                 │
                 ├─ 提示词优化 → POST /v1/chat/completions → 流式/非流式
+                ├─ 中译英翻译 → POST /v1/chat/completions → 英文提示词
                 │
                 ├─ 文生图 → POST /v1/images/generations
                 ├─ 图生图 → POST /v1/images/edits
@@ -346,6 +373,8 @@ pip install -r requirements.txt
 **408 / 429 / 5xx 错误** — 节点会自动重试（`retry_times` 次），无需手动干预。
 
 **新模型不在下拉列表中** — 在 `model (模型)` 字段直接填写模型名即可。
+
+**中译英翻译失败** — 检查 API Key 和模型名称是否正确，确保使用支持翻译的 LLM 模型。
 
 ## 📄 许可证
 

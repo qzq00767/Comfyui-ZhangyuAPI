@@ -35,6 +35,7 @@ from .zhangyu_gpt_img2 import (
     _jittered_sleep,
     _jittered_backoff_seconds,
     _download_bytes_with_retry,
+    _on_retryable_error,
     emit_runtime_status,
     _sanitize_api_response,
     _skip_error_return,
@@ -46,6 +47,7 @@ from .zhangyu_gpt_img2 import (
     _auto_downscale,
     _log,
     DEFAULT_API_BASE_URL,
+    _safe_extract_error_from_response,
 )
 
 # ---------------------------------------------------------------------------
@@ -321,11 +323,13 @@ class ComfyuiZhangyuAPIJimengNode:
                 else:
                     raise RuntimeError(
                         f"即梦轮询失败 HTTP {response.status_code}: "
-                        f"{response.text[:500]}"
+                        f"{_safe_extract_error_from_response(response)}"
                     )
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 consecutive_errors += 1
+                # 始终调用_on_retryable_error来处理连接重置
+                _on_retryable_error(exc)
                 if consecutive_errors > retry_times:
                     raise RuntimeError(
                         f"即梦轮询连续 {consecutive_errors} 次网络错误，"
@@ -529,7 +533,7 @@ class ComfyuiZhangyuAPIJimengNode:
                         err_data = response.json()
                         err_msg = _extract_api_error_message(err_data)
                     except Exception:
-                        err_msg = response.text[:500]
+                        err_msg = _safe_extract_error_from_response(response)
                     last_error = f"即梦 API 错误 {response.status_code}: {err_msg}"
                     if (is_retryable_http_status(response.status_code)
                             and attempt < retry_times):
@@ -675,6 +679,8 @@ class ComfyuiZhangyuAPIJimengNode:
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
+                # 始终调用_on_retryable_error来处理连接重置
+                _on_retryable_error(exc)
                 if attempt < retry_times:
                     emit_runtime_status(
                         unique_id, "running",

@@ -21,6 +21,7 @@ import hashlib
 import os
 import re
 import random
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -64,8 +65,10 @@ DEFAULT_MAX_NODE_TIMEOUT = 1800   # widget max
 
 # Other defaults
 DEFAULT_FETCH_TIMEOUT = 30        # model-fetch route timeout
-DEFAULT_RETRY_TIMES = 3           # default retry count
-DEFAULT_MAX_CONNECTIONS = 30      # httpx connection pool size
+DEFAULT_RETRY_TIMES = 5           # default retry count (increased for connection resets)
+DEFAULT_MAX_CONNECTIONS = 20      # httpx connection pool size
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 10  # keepalive connections
+DEFAULT_USER_AGENT = "Comfyui-ZhangyuAPI/3.0"  # User-Agent header
 
 # Polling stages: (threshold_seconds, interval_seconds)
 # Phase 1 (0-10s):  2.0s  — fast-start: most tasks finish quickly
@@ -128,7 +131,6 @@ def _log(level, *args):
 # each thread gets its own client via threading.local().
 # ---------------------------------------------------------------------------
 _HTTP_CLIENT_LOCAL = threading.local()
-_HTTP_CLIENT_FALLBACK = threading.local()
 
 
 def _get_http_client():
@@ -141,6 +143,20 @@ def _get_http_client():
     """
     client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
     if client is None:
+        # 创建TCP keepalive socket选项
+        socket_options = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),   # 60秒后开始探测
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),  # 每10秒探测一次
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),     # 探测3次失败则关闭
+        ]
+        
+        # 创建HTTP传输层，启用keepalive
+        transport = httpx.HTTPTransport(
+            local_address=None,
+            socket_options=socket_options,
+        )
+        
         _HTTP_CLIENT_LOCAL.client = httpx.Client(
             http2=False,
             timeout=httpx.Timeout(DEFAULT_CONNECT_TIMEOUT,
@@ -148,10 +164,11 @@ def _get_http_client():
                                   pool=DEFAULT_POOL_TIMEOUT),
             limits=httpx.Limits(
                 max_connections=DEFAULT_MAX_CONNECTIONS,
-                max_keepalive_connections=DEFAULT_MAX_CONNECTIONS,
+                max_keepalive_connections=DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
             ),
             trust_env=False,
-            headers={"User-Agent": "Comfyui-ZhangyuAPI/3.0"},
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+            transport=transport,
         )
         client = _HTTP_CLIENT_LOCAL.client
     return client
@@ -174,8 +191,8 @@ def _reset_http_client_for_retry():
     if client is not None:
         try:
             client.close()
-        except Exception:
-            pass  # best-effort — the connection may already be broken
+        except Exception as exc:
+            _log("debug", f"关闭 HTTP 客户端时出错 (可忽略): {type(exc).__name__}")
     _HTTP_CLIENT_LOCAL.client = None
 
 
@@ -206,9 +223,6 @@ def _on_retryable_error(exc):
         _log("warn",
              f"{exc_type}，重置 HTTP 客户端以获取全新 TCP+TLS 连接: {exc_msg}")
         _reset_http_client_for_retry()
-        # Also flag HTTP/2 fallback for future use (no-op while http2=False)
-        if isinstance(exc, httpx.RemoteProtocolError):
-            _HTTP_CLIENT_FALLBACK.disable_http2 = True
     else:
         _log("warn",
              f"可重试异常 (不重置客户端): {exc_type}: {exc_msg}")
@@ -306,7 +320,7 @@ def fetch_available_models(api_base, api_key, timeout_seconds=DEFAULT_FETCH_TIME
     response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
     if response.status_code != 200:
         raise RuntimeError(
-            f"获取模型列表失败 HTTP {response.status_code}: {response.text[:500]}"
+            f"获取模型列表失败 HTTP {response.status_code}: {_safe_extract_error_from_response(response)}"
         )
     data = response.json()
     models = []
@@ -391,8 +405,9 @@ def _call_chat_simple(api_base, api_key, model, messages,
             return (content or "").strip(), data
         except _RETRYABLE_EXCEPTIONS as exc:
             last_error = str(exc)
+            # 始终调用_on_retryable_error来处理连接重置
+            _on_retryable_error(exc)
             if attempt < retry_times:
-                _on_retryable_error(exc)
                 _jittered_sleep(attempt)
                 continue
             break
@@ -784,7 +799,7 @@ def _jittered_backoff_seconds(attempt):
         ``float`` — seconds to sleep before the next retry.
 
     """
-    base = min(2 ** (attempt - 1), 16)
+    base = min(2 ** (attempt - 1), 30)  # 增加到30秒最大退避
     jitter = random.uniform(0, base * 0.5)
     return base + jitter
 
@@ -847,8 +862,9 @@ def _download_bytes_with_retry(url, headers, timeout_seconds,
             return response.content
         except _RETRYABLE_EXCEPTIONS as exc:
             last_error = str(exc)
+            # 始终调用_on_retryable_error来处理连接重置
+            _on_retryable_error(exc)
             if attempt < retry_times:
-                _on_retryable_error(exc)
                 time.sleep(_jittered_backoff_seconds(attempt))
                 continue
             break
@@ -1000,7 +1016,7 @@ def _poll_async_task(
                     )
             else:
                 raise RuntimeError(
-                    f"轮询失败 HTTP {response.status_code}: {response.text[:500]}"
+                    f"轮询失败 HTTP {response.status_code}: {_safe_extract_error_from_response(response)}"
                 )
 
         except _RETRYABLE_EXCEPTIONS as exc:
@@ -1229,10 +1245,10 @@ def emit_runtime_status(
                 "timestamp": time.time(),
             },
         )
-    except Exception:
+    except Exception as exc:
         # Status emission is best-effort; websocket may be disconnected
         # during shutdown or under load.
-        pass
+        _log("debug", f"发送状态更新失败 (可忽略): {type(exc).__name__}")
 
 
 # ===================================================================
@@ -1367,6 +1383,27 @@ def _extract_api_error_message(data):
     if isinstance(error, str):
         return error
     return _safe_json_dumps(_sanitize_api_response(data))[:500]
+
+
+def _safe_extract_error_from_response(response, max_length=500):
+    """Safely extract error message from an HTTP response without leaking sensitive data.
+
+    Tries to parse JSON and extract the error message field.
+    Falls back to a generic message if parsing fails.
+
+    Args:
+        response: ``httpx.Response`` object.
+        max_length: Maximum length of the error message.
+
+    Returns:
+        ``str`` — safe error message.
+    """
+    try:
+        data = response.json()
+        return _extract_api_error_message(data)[:max_length]
+    except Exception as exc:
+        _log("debug", f"解析 API 错误响应失败: {type(exc).__name__}")
+        return f"HTTP {response.status_code}"
 
 
 def _parse_response_images(data, timeout_seconds, error_prefix="API",
@@ -1543,15 +1580,36 @@ def _download_images_async(urls, timeout_seconds,
 
     async def _gather():
         req_timeout = ZHANGYUAPI_timeout(timeout_seconds)
+        semaphore = asyncio.Semaphore(10)  # 限制最多10个并发下载
+        
+        async def _download_with_semaphore(client, url):
+            async with semaphore:
+                return await _download_and_decode(client, url)
+        
+        # 创建TCP keepalive socket选项
+        socket_options = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),   # 60秒后开始探测
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),  # 每10秒探测一次
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),     # 探测3次失败则关闭
+        ]
+        
+        # 创建HTTP传输层，启用keepalive
+        transport = httpx.AsyncHTTPTransport(
+            local_address=None,
+            socket_options=socket_options,
+        )
+        
         async with httpx.AsyncClient(
             http2=False,
             timeout=req_timeout,
             trust_env=False,
             follow_redirects=True,
-            headers={"User-Agent": "Comfyui-ZhangyuAPI/3.0"},
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+            transport=transport,
         ) as client:
             tasks = [
-                asyncio.create_task(_download_and_decode(client, url))
+                asyncio.create_task(_download_with_semaphore(client, url))
                 for url in urls
             ]
             results = await asyncio.gather(
@@ -2108,7 +2166,7 @@ class ComfyuiZhangyuAPIImage2Node:
                         err_data = response.json()
                         err_msg = _extract_api_error_message(err_data)
                     except Exception:
-                        err_msg = response.text[:500]
+                        err_msg = _safe_extract_error_from_response(response)
                     last_error = (
                         f"API 错误 {response.status_code}: {err_msg}"
                     )
@@ -2207,8 +2265,9 @@ class ComfyuiZhangyuAPIImage2Node:
                 _log("warn",
                      f"Image-2 生成失败 (attempt={attempt}/{retry_times}, "
                      f"type={type(exc).__name__}): {last_error}")
+                # 始终调用_on_retryable_error来处理连接重置
+                _on_retryable_error(exc)
                 if attempt < retry_times:
-                    _on_retryable_error(exc)
                     emit_runtime_status(
                         unique_id, "running",
                         f"网络/代理/超时，重试中 ({attempt}/{retry_times})",
@@ -2322,6 +2381,7 @@ _MODEL_FETCH_LOCKS = {}        # per-key lock — prevents concurrent fetches
 _MODEL_FETCH_LOCKS_LOCK = threading.Lock()  # guards _MODEL_FETCH_LOCKS dict
 DEFAULT_MODEL_CACHE_TTL = 900  # seconds (15 min — model lists change rarely)
 DEFAULT_MODEL_FETCH_TIMEOUT = 10  # seconds (quick fail, not worth waiting)
+_MODEL_FETCH_LOCKS_MAX_SIZE = 100  # 最大锁数量，防止内存泄漏
 
 
 def _make_cache_key(api_base, api_key):
@@ -2339,6 +2399,12 @@ def _get_or_create_key_lock(cache_key):
     the freshly populated cache.
     """
     with _MODEL_FETCH_LOCKS_LOCK:
+        # 清理机制：如果锁字典过大，删除最旧的条目
+        if len(_MODEL_FETCH_LOCKS) >= _MODEL_FETCH_LOCKS_MAX_SIZE:
+            # 删除第一个条目（假设是最早的）
+            oldest_key = next(iter(_MODEL_FETCH_LOCKS))
+            del _MODEL_FETCH_LOCKS[oldest_key]
+        
         key_lock = _MODEL_FETCH_LOCKS.get(cache_key)
         if key_lock is None:
             key_lock = threading.Lock()

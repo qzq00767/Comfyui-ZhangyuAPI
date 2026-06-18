@@ -40,6 +40,7 @@ from .zhangyu_gpt_img2 import (
     _on_retryable_error,
     _skip_error_return,
     safe_int,
+    _safe_extract_error_from_response,
 )
 
 
@@ -130,8 +131,8 @@ def _load_presets():
             data = json.loads(f.read_text(encoding="utf-8"))
             name = data.get("name", f.stem)
             presets[name] = data
-        except Exception:
-            pass
+        except Exception as exc:
+            _log("warn", f"加载预设文件 {f.name} 失败: {type(exc).__name__}: {exc}")
     _PRESETS_CACHE = presets
     return presets
 
@@ -244,7 +245,7 @@ def _call_chat_stream(api_base, api_key, model, messages,
         except httpx.HTTPStatusError as exc:
             raise RuntimeError(
                 f"API 请求失败: HTTP {response.status_code}; "
-                f"response={response.text[:2000] if response.text else '<empty>'}"
+                f"response={_safe_extract_error_from_response(response, 2000)}"
             ) from exc
         for line in response.iter_lines():
             if not line.startswith("data: "):
@@ -305,16 +306,15 @@ def _call_chat_nonstream(api_base, api_key, model, messages,
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        body = response.text[:2000] if response.text else "<empty>"
         raise RuntimeError(
-            f"API 请求失败: HTTP {response.status_code}; response={body}"
+            f"API 请求失败: HTTP {response.status_code}; response={_safe_extract_error_from_response(response, 2000)}"
         ) from exc
 
     try:
         data = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            f"API 返回非 JSON: {response.text[:1000]}"
+            f"API 返回非 JSON: {_safe_extract_error_from_response(response, 1000)}"
         ) from exc
 
     raw = _extract_chat_content(data).strip()
@@ -370,8 +370,9 @@ def _call_chat_with_retry(api_base, api_key, model, messages,
             _log("warn",
                  f"LLM 调用失败 (attempt={attempt}/{retry_times}, "
                  f"type={type(exc).__name__}): {last_error}")
+            # 始终调用_on_retryable_error来处理连接重置
+            _on_retryable_error(exc)
             if attempt < retry_times:
-                _on_retryable_error(exc)
                 _jittered_sleep(attempt)
                 continue
             break

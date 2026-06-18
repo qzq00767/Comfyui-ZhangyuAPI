@@ -39,6 +39,8 @@ from .zhangyu_gpt_img2 import (
     normalize_prompt_text,
     _log,
     _skip_error_return,
+    _safe_extract_error_from_response,
+    _on_retryable_error,
 )
 
 DEFAULT_GEMINI_BASE = "https://zhangyuapi.com"
@@ -160,9 +162,8 @@ def _gemini_generate(api_base, api_key, model, prompt, n=1,
         try:
             response.raise_for_status()
         except Exception as exc:
-            body = response.text[:1000] if response.text else "<empty>"
             raise RuntimeError(
-                f"Gemini API 请求失败: HTTP {response.status_code}; body={body}"
+                f"Gemini API 请求失败: HTTP {response.status_code}; body={_safe_extract_error_from_response(response, 1000)}"
             ) from exc
 
         data = response.json()
@@ -424,6 +425,8 @@ class ComfyuiZhangyuAPIGeminiNode:
 
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
+                # 始终调用_on_retryable_error来处理连接重置
+                _on_retryable_error(exc)
                 if attempt < retry_times:
                     emit_runtime_status(
                         unique_id, "running",
