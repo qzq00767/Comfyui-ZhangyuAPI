@@ -218,7 +218,11 @@ class ComfyuiZhangyuAPIGeminiNode:
         return {
             "required": {
                 "api_key (API密钥)": (
-                    "STRING", {"default": "", "multiline": False}),
+                    "STRING", {
+                        "default": "", 
+                        "multiline": False,
+                        "tooltip": "⚠️ 安全提示：如果密钥已泄露，请立即到后台重新生成！请勿将密钥提交到公开仓库。"
+                    }),
                 "prompt (提示词)": (
                     "STRING", {"multiline": True, "default": ""}),
                 "model (模型)": (

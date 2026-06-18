@@ -562,7 +562,11 @@ class ZhangyuAPIPromptOptimizer:
         return {
             "required": {
                 "api_key (密钥)": (
-                    "STRING", {"default": "", "multiline": False}),
+                    "STRING", {
+                        "default": "", 
+                        "multiline": False,
+                        "tooltip": "⚠️ 安全提示：如果密钥已泄露，请立即到后台重新生成！请勿将密钥提交到公开仓库。"
+                    }),
                 "api_base (API地址)": (
                     "STRING", {"default": DEFAULT_API_BASE_URL, "multiline": False}),
                 "prompt (提示词)": (
@@ -841,7 +845,7 @@ class ZhangyuAPIPromptOptimizer:
         Returns:
             ``(optimized_prompt: str, debug_info: str)``.
         """
-        api_key = kwargs.get("api_key (密钥)", "")
+        api_key = kwargs.get("api_key (密钥)", "").strip()
         api_base = normalize_api_base(
                 kwargs.get("api_base (API地址)", DEFAULT_API_BASE_URL)
             )
@@ -1134,7 +1138,11 @@ class ZhangyuAPITranslateNode:
         return {
             "required": {
                 "api_key (API密钥)": (
-                    "STRING", {"default": "", "multiline": False}),
+                    "STRING", {
+                        "default": "", 
+                        "multiline": False,
+                        "tooltip": "⚠️ 安全提示：如果密钥已泄露，请立即到后台重新生成！请勿将密钥提交到公开仓库。"
+                    }),
                 "prompt_cn (中文提示词)": (
                     "STRING", {"multiline": True, "default": ""}),
                 "model (模型)": (

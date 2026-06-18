@@ -99,6 +99,16 @@ for _name in ("LocalProtocolError", "ProtocolError"):
         _RETRYABLE_EXCEPTIONS += (_cls,)
 del _name, _cls
 
+
+class _EmptyDataRetryableError(Exception):
+    """API返回空数据时的可重试异常。
+    
+    用于服务端瞬时高负载时返回空 data: [] 的情况，
+    可以通过指数退避重试恢复。
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Centralized logging — timestamped, level-filtered, safe for multi-thread
 # ---------------------------------------------------------------------------
@@ -721,6 +731,36 @@ def _auto_downscale(image_tensor, max_total_pixels=4 * 1024 * 1024):
         mode="bilinear", align_corners=False,
     )
     return scaled.movedim(1, -1)                    # BCHW → BHWC
+
+
+def _preprocess_compress_image(image_tensor, target_max_pixels=2 * 1024 * 1024, 
+                                 target_max_bytes=500 * 1024):
+    """预处理压缩图像，确保发送前符合API限制。
+    
+    Args:
+        image_tensor: IMAGE tensor
+        target_max_pixels: 目标最大像素数 (默认2MP)
+        target_max_bytes: 目标最大字节数 (默认500KB)
+    
+    Returns:
+        压缩后的 IMAGE tensor
+    """
+    # 第一步：压缩像素数
+    tensor = _auto_downscale(image_tensor, target_max_pixels)
+    
+    # 第二步：检查文件大小，如果超过限制继续压缩
+    png_bytes = tensor_to_png_bytes(tensor)
+    while len(png_bytes) > target_max_bytes:
+        if tensor.dim() == 4:
+            h, w = tensor.shape[1], tensor.shape[2]
+        else:
+            h, w = tensor.shape[0], tensor.shape[1]
+        if h <= 64 or w <= 64:
+            break
+        tensor = _auto_downscale(tensor, max_total_pixels=(h * w) // 4)
+        png_bytes = tensor_to_png_bytes(tensor)
+    
+    return tensor
 
 
 def _skip_error_return(error_msg, return_types, unique_id=None,
@@ -1432,7 +1472,8 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API",
     """
     items = data.get("data")
     if not items:
-        raise RuntimeError(f"API 未返回图片数据: {data}")
+        # 空数据可能是服务端瞬时高负载，抛出可重试异常
+        raise _EmptyDataRetryableError(f"API 未返回图片数据 (可能服务端瞬时高负载): {data}")
     if not isinstance(items, list):
         items = [items]
 
@@ -1685,7 +1726,11 @@ class ComfyuiZhangyuAPIImage2Node:
         return {
             "required": {
                 "api_key (API密钥)": (
-                    "STRING", {"default": "", "multiline": False}),
+                    "STRING", {
+                        "default": "", 
+                        "multiline": False,
+                        "tooltip": "⚠️ 安全提示：如果密钥已泄露，请立即到后台重新生成！请勿将密钥提交到公开仓库。"
+                    }),
                 "prompt (提示词)": (
                     "STRING", {"default": "", "multiline": True}),
                 "mode (模式)": (
@@ -1767,16 +1812,9 @@ class ComfyuiZhangyuAPIImage2Node:
             tensor = kwargs.get(f"image_{i:02d}")
             if tensor is None:
                 continue
-            tensor = _auto_downscale(tensor)
+            # 预处理压缩：确保发送前符合API限制
+            tensor = _preprocess_compress_image(tensor)
             png_bytes = tensor_to_png_bytes(tensor)
-            # If PNG exceeds the API's 1024 KB part limit, keep halving
-            # dimensions until it fits (with 10 % safety margin).
-            while len(png_bytes) > 900 * 1024:
-                h, w = tensor.shape[1], tensor.shape[2]
-                if h <= 64 or w <= 64:
-                    break  # already tiny — give up
-                tensor = _auto_downscale(tensor, max_total_pixels=(h * w) // 4)
-                png_bytes = tensor_to_png_bytes(tensor)
             image_payloads.append(
                 (f"image_{i:02d}.png", png_bytes)
             )
@@ -1831,6 +1869,11 @@ class ComfyuiZhangyuAPIImage2Node:
             fields["output_compression"] = output_compression
         if init_images:
             fields["init_images"] = init_images
+        
+        # 强制过滤掉 OpenAI DALL-E 2 格式的 referenced_image_ids
+        # 我们只使用 init_images 格式
+        fields.pop("referenced_image_ids", None)
+        
         return fields
 
     # ------------------------------------------------------------------
@@ -1955,7 +1998,7 @@ class ComfyuiZhangyuAPIImage2Node:
         """
         pbar = ProgressBar(100) if ProgressBar else None
         # -- sanitize inputs --------------------------------------------------
-        api_key = kwargs.get("api_key (API密钥)", "")
+        api_key = kwargs.get("api_key (API密钥)", "").strip()
         prompt = kwargs.get("prompt (提示词)", "")
         mode = kwargs.get("mode (模式)", "AUTO")
         model = (kwargs.get("model (模型)") or "").strip() or "gpt-image-2"
@@ -2024,11 +2067,11 @@ class ComfyuiZhangyuAPIImage2Node:
                              "光影效果、画幅比例、场景环境、人物姿势、服饰发型、"
                              "配饰道具、材质纹理、摄影器材与焦段等全部关键视觉要素，"
                              "保障主体辨识度与画面结构高度还原\n"
-                             "创意优化：在保留原图整体调性与核心特征的前提下，"
-                             "对背景细节、光影层次、色彩氛围做适度创意升级，"
-                             "不改变主体核心形态\n"
-                             "输出规则：仅输出纯 JSON 文本，不添加任何解释、备注、"
-                             "标签与多余话术，提示词总字数控制在 350 字以内"
+                              "创意优化：在保留原图整体调性与核心特征的前提下，"
+                              "对背景细节、光影层次、色彩氛围做适度创意升级，"
+                              "不改变主体核心形态\n"
+                              "输出规则：仅输出纯 JSON 文本，不添加任何解释、备注、"
+                              "标签与多余话术，提示词总字数控制在 100 字以内"
                          )},
                         {"role": "user",
                          "content": [
@@ -2271,6 +2314,21 @@ class ComfyuiZhangyuAPIImage2Node:
                     emit_runtime_status(
                         unique_id, "running",
                         f"网络/代理/超时，重试中 ({attempt}/{retry_times})",
+                        time.time() - start_ts,
+                        attempt, retry_times, timeout_seconds,
+                    )
+                    _jittered_sleep(attempt)
+                    continue
+                break
+            except _EmptyDataRetryableError as exc:
+                # 空数据可重试异常：服务端瞬时高负载，使用指数退避重试
+                last_error = str(exc)
+                _log("warn",
+                     f"Image-2 空数据重试 (attempt={attempt}/{retry_times}): {last_error}")
+                if attempt < retry_times:
+                    emit_runtime_status(
+                        unique_id, "running",
+                        f"服务端返回空数据，重试中 ({attempt}/{retry_times})",
                         time.time() - start_ts,
                         attempt, retry_times, timeout_seconds,
                     )
