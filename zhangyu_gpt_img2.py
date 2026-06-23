@@ -8,7 +8,7 @@ compatible Images API (``/v1/images/generations``, ``/v1/images/edits``).
 
 Features:
 - Real size / quality / format / mask controls sent as API parameters.
-- HTTP/2 via ``httpx`` with forced direct connection (bypasses all proxies).
+- HTTP/1.1 via ``httpx`` with connection pooling and system proxy support.
 - Adaptive task polling with four-stage interval escalation.
 - Concurrent async image downloads via ``asyncio.create_task``.
 - Frontend runtime status bar with live progress updates.
@@ -66,8 +66,8 @@ DEFAULT_MAX_NODE_TIMEOUT = 1800   # widget max
 # Other defaults
 DEFAULT_FETCH_TIMEOUT = 30        # model-fetch route timeout
 DEFAULT_RETRY_TIMES = 5           # default retry count (increased for connection resets)
-DEFAULT_MAX_CONNECTIONS = 20      # httpx connection pool size
-DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 10  # keepalive connections
+DEFAULT_MAX_CONNECTIONS = 5       # httpx connection pool size (减小以避免复用失效连接)
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 2  # keepalive connections (减小以避免复用失效连接)
 DEFAULT_USER_AGENT = "Comfyui-ZhangyuAPI/3.0"  # User-Agent header
 
 # Polling stages: (threshold_seconds, interval_seconds)
@@ -153,18 +153,12 @@ def _get_http_client():
     """
     client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
     if client is None:
-        # 创建TCP keepalive socket选项
-        socket_options = [
-            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),   # 60秒后开始探测
-            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),  # 每10秒探测一次
-            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),     # 探测3次失败则关闭
-        ]
+        # 禁用TCP keepalive，避免104连接重置错误
+        # 不设置socket_options，使用系统默认配置
         
-        # 创建HTTP传输层，启用keepalive
+        # 创建HTTP传输层，不设置socket_options
         transport = httpx.HTTPTransport(
             local_address=None,
-            socket_options=socket_options,
         )
         
         _HTTP_CLIENT_LOCAL.client = httpx.Client(
@@ -173,10 +167,10 @@ def _get_http_client():
                                   read=DEFAULT_READ_TIMEOUT,
                                   pool=DEFAULT_POOL_TIMEOUT),
             limits=httpx.Limits(
-                max_connections=DEFAULT_MAX_CONNECTIONS,
-                max_keepalive_connections=DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+                max_connections=5,  # 减小连接池大小，避免长时间复用失效连接
+                max_keepalive_connections=2,
             ),
-            trust_env=False,
+            trust_env=True,  # 使用系统代理设置，避免网络环境问题
             headers={"User-Agent": DEFAULT_USER_AGENT},
             transport=transport,
         )
@@ -1627,24 +1621,18 @@ def _download_images_async(urls, timeout_seconds,
             async with semaphore:
                 return await _download_and_decode(client, url)
         
-        # 创建TCP keepalive socket选项
-        socket_options = [
-            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),   # 60秒后开始探测
-            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),  # 每10秒探测一次
-            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),     # 探测3次失败则关闭
-        ]
+        # 禁用TCP keepalive，避免104连接重置错误
+        # 不设置socket_options，使用系统默认配置
         
-        # 创建HTTP传输层，启用keepalive
+        # 创建HTTP传输层，不设置socket_options
         transport = httpx.AsyncHTTPTransport(
             local_address=None,
-            socket_options=socket_options,
         )
         
         async with httpx.AsyncClient(
             http2=False,
             timeout=req_timeout,
-            trust_env=False,
+            trust_env=True,  # 使用系统代理设置，避免网络环境问题
             follow_redirects=True,
             headers={"User-Agent": DEFAULT_USER_AGENT},
             transport=transport,
@@ -1770,6 +1758,10 @@ class ComfyuiZhangyuAPIImage2Node:
             "optional": {
                 **{f"image_{i:02d}": ("IMAGE",) for i in range(1, 9)},
                 "mask": ("MASK",),
+                "background (背景)": (
+                    ["auto", "transparent", "opaque"], {"default": "auto"}),
+                "moderation (审核模式)": (
+                    ["auto", "low"], {"default": "auto"}),
                 "llm_model (反推用LLM模型)": (
                     "STRING", {"default": "gpt-5.5",
                                "multiline": False,
@@ -1825,7 +1817,8 @@ class ComfyuiZhangyuAPIImage2Node:
 
     def _payload_fields(self, model, prompt, size, quality, response_format,
                         output_format, output_compression, n_images,
-                        init_images=None, aspect_ratio=None):
+                        init_images=None, aspect_ratio=None,
+                        background="auto", moderation="auto"):
         """Build the JSON payload fields for an Images API request.
 
         Only includes non-default values to keep the request minimal.
@@ -1842,6 +1835,8 @@ class ComfyuiZhangyuAPIImage2Node:
             n_images: Number of images to generate (1-5).
             init_images: Optional ``list[str]`` of base64 data URLs for
                 reference / init images.
+            background: ``"auto"``, ``"transparent"``, or ``"opaque"``.
+            moderation: ``"auto"`` or ``"low"``.
 
         Returns:
             ``dict`` — request body fields.
@@ -1869,6 +1864,12 @@ class ComfyuiZhangyuAPIImage2Node:
             fields["output_compression"] = output_compression
         if init_images:
             fields["init_images"] = init_images
+        
+        # background and moderation parameters (for gpt-image-2)
+        if background and background != "auto":
+            fields["background"] = background
+        if moderation and moderation != "auto":
+            fields["moderation"] = moderation
         
         # 强制过滤掉 OpenAI DALL-E 2 格式的 referenced_image_ids
         # 我们只使用 init_images 格式
@@ -2023,6 +2024,12 @@ class ComfyuiZhangyuAPIImage2Node:
             ["png", "jpeg", "webp"], "jpeg")
         output_compression = safe_int(
             kwargs.get("output_compression (压缩率)", 85), 85, 0, 100)
+        background = safe_choice(
+            kwargs.get("background (背景)", "auto"),
+            ["auto", "transparent", "opaque"], "auto")
+        moderation = safe_choice(
+            kwargs.get("moderation (审核模式)", "auto"),
+            ["auto", "low"], "auto")
         seed = safe_int(
             kwargs.get("seed (本地种子-不发送API)",
                        kwargs.get("seed (种子)", 0)),
@@ -2150,6 +2157,8 @@ class ComfyuiZhangyuAPIImage2Node:
             quality, response_format, output_format, output_compression,
             n_images, init_images=init_images,
             aspect_ratio=aspect_ratio,
+            background=background,
+            moderation=moderation,
         )
 
         print(

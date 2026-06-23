@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Comfyui-ZhangyuAPI — 可灵格式视频生成节点.
+Comfyui-ZhangyuAPI — 可灵格式视频生成节点（多功能合一）.
 
-适配 NewAPI 的 Kling 兼容端点：
-- 文生视频: ``POST /kling/v1/videos/text2video``
-- 图生视频: ``POST /kling/v1/videos/image2video``
-- 状态查询: ``GET /kling/v1/videos/text2video/{task_id}`` 或
-   ``GET /kling/v1/videos/image2video/{task_id}``
-- 视频下载: 从完成状态响应中的 ``url`` 字段直接下载
+支持模式：
+- 文生视频: POST /kling/v1/videos/text2video
+- 图生视频: POST /kling/v1/videos/image2video
+- 多图转视频: POST /kling/v1/videos/multi-image2video
+- 视频延长: POST /kling/v1/videos/video-extend
+- 唇形同步: POST /kling/v1/videos/lip-sync
 
-Auth: ``Authorization: Bearer <api_key>`` (所有端点).
+Auth: Authorization: Bearer <api_key>
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -20,10 +21,15 @@ import random
 import time
 import uuid
 
+import numpy as np
+from PIL import Image
+from io import BytesIO
+
 from .zhangyu_gpt_img2 import (
     _get_http_client,
     ZHANGYUAPI_timeout,
     ZHANGYUAPI_get,
+    ZHANGYUAPI_post,
     normalize_api_base,
     denormalize_api_base,
     safe_choice,
@@ -47,23 +53,7 @@ from .zhangyu_gpt_img2 import (
     DEFAULT_API_BASE_URL,
     _safe_extract_error_from_response,
 )
-# Kling model filter patterns (for model_list output port)
-_KLING_MODEL_PATTERNS = [
-    "kling", "kling-v",
-]
 
-
-def _filter_kling_models(all_models):
-    """Filter model list to Kling-compatible models."""
-    return _filter_models_by_patterns(
-        all_models, _KLING_MODEL_PATTERNS,
-        mode="include", fallback_empty=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# VideoFromFile — for ComfyUI VIDEO output type
-# ---------------------------------------------------------------------------
 try:
     from comfy_api.input_impl import VideoFromFile
 except ImportError:
@@ -83,43 +73,142 @@ DEFAULT_MIN_VIDEO_TIMEOUT = 120
 DEFAULT_MAX_VIDEO_TIMEOUT = 3600
 DEFAULT_VIDEO_RETRY_TIMES = 2
 
-VIDEO_SIZES = [
-    "1280x720",      # 720p 横屏
-    "720x1280",      # 720p 竖屏
-    "1920x1080",     # 1080p 横屏
-    "1080x1920",     # 1080p 竖屏
-    "1024x1792",     # HD 竖屏
-    "1792x1024",     # HD 横屏
+KLING_MODELS = ["kling-v2-1-master", "kling-v2-master", "kling-v1-6", "kling-v1-5", "kling-v1"]
+KLING_MODES = ["std", "pro"]
+ASPECT_RATIOS = ["1:1", "16:9", "9:16"]
+DURATIONS = ["5", "10"]
+
+CAMERA_TYPES = [
+    "none", "horizontal", "vertical", "zoom",
+    "vertical_shake", "horizontal_shake", "rotate",
+    "master_down_zoom", "master_zoom_up",
+    "master_right_rotate_zoom", "master_left_rotate_zoom",
+]
+
+KLING_ZH_VOICES = [
+    ("阳光少年", "genshin_vindi2"), ("懂事小弟", "zhinen_xuesheng"),
+    ("运动少年", "tiyuxi_xuedi"), ("青春少女", "ai_shatang"),
+    ("温柔小妹", "genshin_klee2"), ("元气少女", "genshin_kirara"),
+    ("阳光男生", "ai_kaiya"), ("幽默小哥", "tiexin_nanyou"),
+    ("甜美邻家", "girlfriend_1_speech02"), ("温柔姐姐", "chat1_female_new-3"),
+]
+
+KLING_EN_VOICES = [
+    ("Sunny", "genshin_vindi2"), ("Sage", "zhinen_xuesheng"),
+    ("Blossom", "ai_shatang"), ("Peppy", "genshin_klee2"),
+    ("Shine", "ai_kaiya"), ("Anchor", "oversea_male1"),
+    ("Tender", "chat1_female_new-3"),
 ]
 
 
-
 # ===================================================================
-# Helper: parse size
+# Helpers
 # ===================================================================
 
-def _parse_size(size_str):
-    """Parse ``"WxH"`` → ``(width, height)``; defaults to ``(1280, 720)``."""
+def _get_camera_json(camera, camera_value=0):
+    camera_map = {
+        "none": {"type": "empty", "horizontal": 0, "vertical": 0, "zoom": 0, "tilt": 0, "pan": 0, "roll": 0},
+        "horizontal": {"type": "horizontal", "horizontal": camera_value, "vertical": 0, "zoom": 0, "tilt": 0, "pan": 0, "roll": 0},
+        "vertical": {"type": "vertical", "horizontal": 0, "vertical": camera_value, "zoom": 0, "tilt": 0, "pan": 0, "roll": 0},
+        "zoom": {"type": "zoom", "horizontal": 0, "vertical": 0, "zoom": camera_value, "tilt": 0, "pan": 0, "roll": 0},
+        "vertical_shake": {"type": "vertical_shake", "horizontal": 0, "vertical": camera_value, "zoom": 0.5, "tilt": 0, "pan": 0, "roll": 0},
+        "horizontal_shake": {"type": "horizontal_shake", "horizontal": camera_value, "vertical": 0, "zoom": 0.5, "tilt": 0, "pan": 0, "roll": 0},
+        "rotate": {"type": "rotate", "horizontal": 0, "vertical": 0, "zoom": 0, "tilt": 0, "pan": camera_value, "roll": 0},
+        "master_down_zoom": {"type": "zoom", "horizontal": 0, "vertical": 0, "zoom": camera_value, "tilt": camera_value, "pan": 0, "roll": 0},
+        "master_zoom_up": {"type": "zoom", "horizontal": 0.2, "vertical": 0, "zoom": camera_value, "tilt": 0, "pan": 0, "roll": 0},
+        "master_right_rotate_zoom": {"type": "rotate", "horizontal": 0, "vertical": 0, "zoom": camera_value, "tilt": 0, "pan": 0, "roll": camera_value},
+        "master_left_rotate_zoom": {"type": "rotate", "horizontal": 0, "vertical": 0, "zoom": camera_value, "tilt": 0, "pan": camera_value, "roll": 0},
+    }
+    return json.dumps(camera_map.get(camera, camera_map["none"]))
+
+
+def _image_to_base64(image_tensor):
+    if image_tensor is None:
+        return None
     try:
-        w, h = str(size_str).split("x")
-        return int(w), int(h)
-    except (ValueError, AttributeError):
-        return 1280, 720
+        i = 255.0 * image_tensor.cpu().numpy()[0]
+        img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+    except Exception as e:
+        _log("warn", f"图片转base64失败: {e}")
+        return None
+
+
+def _poll_task(base, headers, task_id, endpoint, timeout, retries, on_tick=None):
+    url = f"{base}/kling/v1/videos/{endpoint}/{task_id}"
+    start = time.time()
+    poll_start = time.time()
+    errors = 0
+
+    while True:
+        elapsed = time.time() - start
+        poll_elapsed = time.time() - poll_start
+        remaining = timeout - int(poll_elapsed + 0.999)
+        if remaining <= 0:
+            raise RuntimeError(f"轮询超时 ({timeout}s)")
+
+        try:
+            resp = ZHANGYUAPI_get(url, remaining, headers={**headers, "Content-Type": "application/json"})
+            if resp.status_code == 200:
+                errors = 0
+                data = resp.json().get("data", resp.json())
+                status = str(data.get("task_status", data.get("status", ""))).lower()
+                if status in ("succeed", "success", "completed", "done"):
+                    return data
+                if status in ("failed", "error"):
+                    raise RuntimeError(f"任务失败: {data.get('task_status_msg', data.get('error', ''))}")
+            elif is_retryable_http_status(resp.status_code):
+                errors += 1
+                if errors > retries:
+                    raise RuntimeError(f"连续 {errors} 次 HTTP 错误")
+            else:
+                raise RuntimeError(f"轮询失败 HTTP {resp.status_code}: {_safe_extract_error_from_response(resp)}")
+        except _RETRYABLE_EXCEPTIONS as exc:
+            errors += 1
+            _on_retryable_error(exc)
+            if errors > retries:
+                raise RuntimeError(f"连续 {errors} 次网络错误: {exc}")
+
+        if errors > 0:
+            time.sleep(_jittered_backoff_seconds(errors))
+        else:
+            interval = 2.0 if poll_elapsed < 15 else 5.0 if poll_elapsed < 60 else 10.0
+            if on_tick:
+                on_tick(elapsed, poll_elapsed, interval)
+            time.sleep(interval)
+
+
+def _download_video(video_url, headers, timeout, retries):
+    return _download_bytes_with_retry(video_url, headers, timeout, retries, label="Kling视频")
+
+
+def _save_video(video_bytes, prefix="zhangyuapi_kling"):
+    try:
+        import folder_paths
+        output_dir = folder_paths.get_output_directory()
+    except:
+        output_dir = os.path.join(os.path.dirname(__file__), "..", "..", "output")
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, f"{prefix}_{uuid.uuid4().hex[:8]}.mp4")
+    with open(filepath, "wb") as f:
+        f.write(video_bytes)
+    return filepath
+
+
+def _extract_video_url(task_data):
+    if "task_result" in task_data and "videos" in task_data["task_result"]:
+        return task_data["task_result"]["videos"][0].get("url")
+    return task_data.get("url")
 
 
 # ===================================================================
-# Node class
+# Node: 可灵多功能视频节点
 # ===================================================================
 
 class ComfyuiZhangyuAPIKlingNode:
-    """ComfyUI 可灵格式视频生成节点 — Kling API 兼容.
-
-    根据是否提供参考图自动选择 text2video 或 image2video 模式。
-
-    Node display name: **ComfyUI-zhangyuapi-可灵格式**
-    """
-
-    SIZES = VIDEO_SIZES
+    """ComfyUI 可灵多功能视频生成节点."""
 
     RETURN_TYPES = ("VIDEO", "STRING", "STRING")
     RETURN_NAMES = ("video", "response", "model_list")
@@ -128,524 +217,258 @@ class ComfyuiZhangyuAPIKlingNode:
 
     @classmethod
     def INPUT_TYPES(cls):
+        zh_voices = [n for n, _ in KLING_ZH_VOICES]
+        en_voices = [n for n, _ in KLING_EN_VOICES]
         return {
             "required": {
-                "api_key (API密钥)": (
-                    "STRING", {
-                        "default": "", 
-                        "multiline": False,
-                        "tooltip": "⚠️ 安全提示：如果密钥已泄露，请立即到后台重新生成！请勿将密钥提交到公开仓库。"
-                    }),
-                "prompt (提示词)": (
-                    "STRING", {"default": "", "multiline": True}),
-                "model (模型)": (
-                    "STRING", {"default": "kling-v1", "multiline": False,
-                               "placeholder": "kling-v1"}),
-                "api_base (接口域名)": (
-                    "STRING", {"default": DEFAULT_KLING_BASE, "multiline": False}),
-                "size (分辨率)": (
-                    cls.SIZES, {"default": "1280x720"}),
-                "duration (时长秒数)": (
-                    "INT", {"default": 8, "min": 4, "max": 60}),
-                "seed (种子)": (
-                    "INT", {"default": 0, "min": 0, "max": 2147483647,
-                            "control_after_generate": True}),
-                "timeout_seconds (超时秒数)": (
-                    "INT", {"default": DEFAULT_VIDEO_TIMEOUT,
-                            "min": DEFAULT_MIN_VIDEO_TIMEOUT,
-                            "max": DEFAULT_MAX_VIDEO_TIMEOUT}),
-                "retry_times (重试次数)": (
-                    "INT", {"default": DEFAULT_VIDEO_RETRY_TIMES,
-                            "min": 1, "max": 5}),
+                "api_key (API密钥)": ("STRING", {"default": ""}),
+                "mode (功能模式)": (
+                    ["文生视频", "图生视频", "多图转视频", "视频延长", "唇形同步"],
+                    {"default": "文生视频"}),
+                "prompt (提示词)": ("STRING", {"default": "", "multiline": True}),
+                "model (模型)": (KLING_MODELS, {"default": "kling-v1-6"}),
+                "aspect_ratio (宽高比)": (ASPECT_RATIOS, {"default": "16:9"}),
+                "duration (时长)": (DURATIONS, {"default": "5"}),
+                "kling_mode (std/pro)": (KLING_MODES, {"default": "std"}),
+                "seed (种子)": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+                "timeout_seconds (超时秒数)": ("INT", {"default": 600, "min": 30, "max": 900}),
+                "retry_times (重试次数)": ("INT", {"default": 10, "min": 1, "max": 30}),
             },
             "optional": {
-                "negative_prompt (反向提示词)": (
-                    "STRING", {"default": "", "multiline": True}),
-                "fps (帧率)": (
-                    "INT", {"default": 24, "min": 1, "max": 120}),
-                "n (生成数量)": (
-                    "INT", {"default": 1, "min": 1, "max": 4}),
+                "negative_prompt (反向提示词)": ("STRING", {"default": "", "multiline": True}),
+                "imagination (想象力)": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "camera (镜头运动)": (CAMERA_TYPES, {"default": "none"}),
+                "camera_value (镜头强度)": ("FLOAT", {"default": 0, "min": -10, "max": 10, "step": 0.1}),
                 "image_01 (参考图)": ("IMAGE",),
+                "image_02 (参考图2)": ("IMAGE",),
+                "image_03 (参考图3)": ("IMAGE",),
+                "image_04 (参考图4)": ("IMAGE",),
+                "video_id (视频ID，延长/唇形同步用)": ("STRING", {"default": "", "forceInput": True}),
+                "task_id (任务ID，唇形同步用)": ("STRING", {"default": "", "forceInput": True}),
+                "lip_text (唇形同步文本)": ("STRING", {"default": "", "multiline": True}),
+                "voice_language (语言)": (["zh", "en"], {"default": "zh"}),
+                "zh_voice (中文音色)": (zh_voices, {"default": zh_voices[0]}),
+                "en_voice (英文音色)": (en_voices, {"default": en_voices[0]}),
+                "voice_speed (语速)": ("FLOAT", {"default": 1.0, "min": 0.8, "max": 2.0, "step": 0.1}),
+                "skip_error (跳过错误)": ("BOOLEAN", {"default": False}),
             },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-                "skip_error": ("BOOLEAN", {"default": False}),
-            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    @classmethod
-    def VALIDATE_INPUTS(cls, input_types):
-        return True
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        key = json.dumps(
-            {k: str(v) if not isinstance(v, (list, tuple))
-               else f"<tensor_{len(v)}>"
-             for k, v in kwargs.items()
-             if k != "image_01 (参考图)"},
-            sort_keys=True, ensure_ascii=False,
-        )
-        return hashlib.md5(key.encode()).hexdigest()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _collect_image(kwargs):
-        """Collect reference image from ``image_01 (参考图)`` input.
-
-        Returns:
-            ``str | None`` — base64 data-URL string, or ``None``.
-        """
-        tensor = kwargs.get("image_01 (参考图)")
-        if tensor is None:
-            return None
-        tensor = _auto_downscale(tensor)
-        return tensor_to_data_url(tensor)
-
-    @staticmethod
-    def _build_payload(model, prompt, width, height, duration,
-                        negative_prompt=None, fps=None, n=1, seed=None,
-                        image_data_url=None):
-        """Build JSON request body for Kling video generation.
-
-        Returns:
-            ``dict`` — JSON-serializable payload.
-        """
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "width": width,
-            "height": height,
-            "duration": duration,
-            "n": n,
-        }
-
-        if seed is not None and seed > 0:
-            payload["seed"] = seed
-
-        if fps is not None and fps > 0:
-            payload["fps"] = fps
-
-        if image_data_url:
-            payload["image"] = image_data_url
-
-        if negative_prompt:
-            payload["metadata"] = {"negative_prompt": negative_prompt}
-
-        return payload
-
-    # ------------------------------------------------------------------
-    # API request
-    # ------------------------------------------------------------------
-
-    def _request_generation(self, api_base, headers, payload,
-                             is_image2video, timeout_seconds):
-        """POST to Kling video endpoint (text2video or image2video)."""
-        sub_path = "image2video" if is_image2video else "text2video"
-        url = f"{api_base}/kling/v1/videos/{sub_path}"
-        return _get_http_client().post(
-            url,
-            json=payload,
-            headers={**headers, "Content-Type": "application/json"},
-            timeout=ZHANGYUAPI_timeout(timeout_seconds),
-        )
-
-    # ------------------------------------------------------------------
-    # Polling
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _poll_kling_task(api_base, headers, task_id, is_image2video,
-                          timeout_seconds, retry_times, on_tick=None):
-        """Poll Kling task status endpoint until completion.
-
-        Returns the completed task data dict (contains ``url`` field).
-        """
-        sub_path = "image2video" if is_image2video else "text2video"
-        url = f"{api_base}/kling/v1/videos/{sub_path}/{task_id}"
-        start_ts = time.time()
-        poll_start = time.time()
-        consecutive_errors = 0
-        stages = ((15, 2.0), (60, 5.0), (float("inf"), 10.0))
-
-        while True:
-            elapsed = time.time() - start_ts
-            poll_elapsed = time.time() - poll_start
-            remaining = timeout_seconds - int(poll_elapsed + 0.999)
-
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"Kling 任务轮询超时 ({timeout_seconds}s)，"
-                    f"已等待 {elapsed:.1f}s"
-                )
-
-            try:
-                response = ZHANGYUAPI_get(
-                    url, remaining,
-                    headers={**headers, "Content-Type": "application/json"},
-                )
-
-                if response.status_code == 200:
-                    consecutive_errors = 0
-                    data = response.json()
-                    status = str(data.get("status", "")).lower()
-
-                    if status in ("completed", "succeeded", "success", "done"):
-                        if not data.get("url"):
-                            raise RuntimeError(
-                                "Kling 任务已完成但未返回视频 URL"
-                            )
-                        return data
-                    if status in ("failed", "error", "cancelled", "canceled"):
-                        err = (data.get("error") or data.get("message") or
-                               json.dumps(data, ensure_ascii=False)[:300])
-                        raise RuntimeError(
-                            f"Kling 任务失败 (task_id={task_id}): {err}"
-                        )
-
-                elif is_retryable_http_status(response.status_code):
-                    consecutive_errors += 1
-                    if consecutive_errors > retry_times:
-                        raise RuntimeError(
-                            f"Kling 轮询连续 {consecutive_errors} 次 HTTP "
-                            f"{response.status_code} 错误，中止"
-                        )
-                else:
-                    raise RuntimeError(
-                        f"Kling 轮询失败 HTTP {response.status_code}: "
-                        f"{_safe_extract_error_from_response(response)}"
-                    )
-
-            except _RETRYABLE_EXCEPTIONS as exc:
-                consecutive_errors += 1
-                # 始终调用_on_retryable_error来处理连接重置
-                _on_retryable_error(exc)
-                if consecutive_errors > retry_times:
-                    raise RuntimeError(
-                        f"Kling 轮询连续 {consecutive_errors} 次网络错误，"
-                        f"中止: {exc}"
-                    )
-
-            if consecutive_errors > 0:
-                time.sleep(_jittered_backoff_seconds(consecutive_errors))
-            else:
-                interval = 2.0
-                for threshold, iv in stages:
-                    if poll_elapsed < threshold:
-                        interval = iv
-                        break
-                if on_tick is not None:
-                    on_tick(elapsed, poll_elapsed, interval)
-                time.sleep(interval)
-
-    # ------------------------------------------------------------------
-    # Video download
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _download_video_from_url(video_url, headers, timeout_seconds,
-                                  retry_times):
-        """Download video bytes from a direct URL."""
-        return _download_bytes_with_retry(
-            video_url, headers, timeout_seconds, retry_times, label="Kling视频",
-        )
-
-    # ------------------------------------------------------------------
-    # Save video
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _save_video(video_bytes, video_id):
-        """Save video bytes to ComfyUI output directory."""
+    def generate(self, api_key, mode, prompt, model, aspect_ratio, duration, kling_mode,
+                 seed, timeout_seconds, retry_times,
+                 negative_prompt="", imagination=0.5, camera="none", camera_value=0,
+                 image_01=None, image_02=None, image_03=None, image_04=None,
+                 video_id="", task_id="", lip_text="", voice_language="zh",
+                 zh_voice="", en_voice="", voice_speed=1.0,
+                 skip_error=False, unique_id=None):
         try:
-            import folder_paths
-            output_dir = folder_paths.get_output_directory()
-        except Exception:
-            output_dir = os.path.join(
-                os.path.dirname(__file__), "..", "..", "output"
-            )
-            output_dir = os.path.abspath(output_dir)
+            base = normalize_api_base(DEFAULT_KLING_BASE)
+            headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
-        os.makedirs(output_dir, exist_ok=True)
-        safe_id = "".join(
-            c for c in str(video_id) if c.isalnum() or c in "_-"
-        )
-        filename = f"zhangyuapi_kling_{safe_id}_{uuid.uuid4().hex[:8]}.mp4"
-        filepath = os.path.join(output_dir, filename)
-        with open(filepath, "wb") as f:
-            f.write(video_bytes)
-        print(f"[Comfyui-ZhangyuAPI-Kling] saved: {filepath}")
-        return filepath
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
-    def generate(self, **kwargs):
-        """Thin wrapper with ``skip_error`` handling."""
-        skip_error = kwargs.get("skip_error", False)
-        try:
-            return self._generate_impl(**kwargs)
+            if mode == "文生视频":
+                return self._text2video(base, headers, prompt, model, aspect_ratio, duration,
+                                        kling_mode, seed, timeout_seconds, retry_times,
+                                        negative_prompt, imagination, camera, camera_value, unique_id)
+            elif mode == "图生视频":
+                return self._image2video(base, headers, prompt, model, aspect_ratio, duration,
+                                         kling_mode, seed, timeout_seconds, retry_times,
+                                         negative_prompt, imagination, camera, camera_value,
+                                         image_01, unique_id)
+            elif mode == "多图转视频":
+                return self._multi_image(base, headers, prompt, model, aspect_ratio, duration,
+                                         kling_mode, seed, timeout_seconds, retry_times,
+                                         negative_prompt, [image_01, image_02, image_03, image_04], unique_id)
+            elif mode == "视频延长":
+                return self._extend(base, headers, video_id, prompt, timeout_seconds, retry_times, unique_id)
+            elif mode == "唇形同步":
+                return self._lip_sync(base, headers, video_id, task_id, lip_text, voice_language,
+                                      zh_voice, en_voice, voice_speed, timeout_seconds, retry_times, unique_id)
         except Exception as exc:
             if not skip_error:
                 raise
-            error_msg = f"{type(exc).__name__}: {exc}"
-            _log("warn", f"skip_error 模式，节点失败: {error_msg}")
-            return _skip_error_return(
-                error_msg, self.RETURN_TYPES,
-                unique_id=kwargs.get("unique_id"),
-                retry_times=kwargs.get("retry_times (重试次数)", 3),
-                timeout_seconds=kwargs.get("timeout_seconds (超时秒数)", 600),
-            )
+            return _skip_error_return(str(exc), self.RETURN_TYPES, unique_id, retry_times, timeout_seconds)
 
-    def _generate_impl(self, **kwargs):
-        """Execute a Kling-format video generation request.
+    def _text2video(self, base, headers, prompt, model, aspect_ratio, duration, kling_mode,
+                    seed, timeout, retries, negative_prompt, imagination, camera, camera_value, uid):
+        camera_json = _get_camera_json(camera, camera_value) if model == "kling-v1" else _get_camera_json("none", 0)
+        payload = {
+            "prompt": prompt, "negative_prompt": negative_prompt,
+            "aspect_ratio": aspect_ratio, "duration": duration,
+            "model_name": model, "imagination": imagination,
+            "num_videos": 1, "camera_json": camera_json, "seed": seed,
+        }
+        if model != "kling-v2-master":
+            payload["mode"] = kling_mode
 
-        Auto-selects text2video or image2video mode based on whether
-        reference images are provided.
+        if uid:
+            emit_runtime_status(uid, "running", "可灵文生视频请求中", 0, 0, retries, timeout)
 
-        Returns:
-            ``(VideoFromFile | str, str, str)``.
-        """
-        # -- sanitize inputs --------------------------------------------------
-        api_key = kwargs.get("api_key (API密钥)", "").strip()
-        api_base = normalize_api_base(
-            kwargs.get("api_base (接口域名)", DEFAULT_KLING_BASE))
-        prompt = kwargs.get("prompt (提示词)", "")
-        model = kwargs.get("model (模型)", "").strip() or "kling-v1"
-        size = safe_choice(
-            kwargs.get("size (分辨率)", "1280x720"),
-            self.SIZES, "1280x720")
-        duration = safe_int(kwargs.get("duration (时长秒数)", 8), 8, 4, 60)
-        seed = safe_int(kwargs.get("seed (种子)", 0), 0, 0, 2147483647)
-        timeout_seconds = safe_int(
-            kwargs.get("timeout_seconds (超时秒数)", DEFAULT_VIDEO_TIMEOUT),
-            DEFAULT_VIDEO_TIMEOUT,
-            DEFAULT_MIN_VIDEO_TIMEOUT,
-            DEFAULT_MAX_VIDEO_TIMEOUT,
-        )
-        retry_times = safe_int(
-            kwargs.get("retry_times (重试次数)", DEFAULT_VIDEO_RETRY_TIMES),
-            DEFAULT_VIDEO_RETRY_TIMES, 1, 5)
-        unique_id = kwargs.get("unique_id")
-        start_ts = time.time()
+        resp = ZHANGYUAPI_post(f"{base}/kling/v1/videos/text2video", timeout, headers=headers, json=payload)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"API 错误 {resp.status_code}: {_safe_extract_error_from_response(resp)}")
 
-        # -- optional fields --------------------------------------------------
-        negative_prompt = normalize_prompt_text(
-            kwargs.get("negative_prompt (反向提示词)", ""))
-        fps = safe_int(kwargs.get("fps (帧率)", 0), 0, 0, 120)
-        n = safe_int(kwargs.get("n (生成数量)", 1), 1, 1, 4)
+        task_id = resp.json().get("data", {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("未返回 task_id")
 
-        image_data_url = self._collect_image(kwargs)
-        is_image2video = image_data_url is not None
+        task_data = _poll_task(base, headers, task_id, "text2video", timeout - 10, retries)
+        video_url = _extract_video_url(task_data)
+        if not video_url:
+            raise RuntimeError("未返回视频 URL")
 
-        # -- validate ---------------------------------------------------------
-        if not api_key:
-            emit_runtime_status(unique_id, "error", "API Key 为空",
-                                0.0, 0, retry_times, timeout_seconds)
-            raise ValueError("API Key 不能为空")
+        video_bytes = _download_video(video_url, headers, timeout, retries)
+        filepath = _save_video(video_bytes)
+        video_obj = VideoFromFile(filepath) if VideoFromFile else filepath
+        return (video_obj, json.dumps({"status": "success", "task_id": task_id}, ensure_ascii=False), "[]")
 
-        clean_prompt = normalize_prompt_text(prompt)
-        if not clean_prompt:
-            raise ValueError("prompt 不能为空")
+    def _image2video(self, base, headers, prompt, model, aspect_ratio, duration, kling_mode,
+                     seed, timeout, retries, negative_prompt, imagination, camera, camera_value,
+                     image_01, uid):
+        camera_json = _get_camera_json(camera, camera_value) if model in ("kling-v1", "kling-v1-5", "kling-v1-6") else _get_camera_json("none", 0)
+        img_b64 = _image_to_base64(image_01)
 
-        width, height = _parse_size(size)
+        payload = {
+            "prompt": prompt, "negative_prompt": negative_prompt,
+            "aspect_ratio": aspect_ratio, "duration": duration,
+            "model_name": model, "imagination": imagination,
+            "num_videos": 1, "camera_json": camera_json, "seed": seed,
+        }
+        if model != "kling-v2-master":
+            payload["mode"] = kling_mode
+        if img_b64:
+            payload["image"] = img_b64
 
-        # -- fetch model list for output port (best-effort) --------------------
-        model_list = []
-        try:
-            all_models = fetch_available_models_cached(
-                api_base, api_key)
-            model_list = _filter_kling_models(all_models)
-        except Exception as exc:
-            print(f"[Kling] 模型列表获取失败（不影响生成）: {exc}")
+        if uid:
+            emit_runtime_status(uid, "running", "可灵图生视频请求中", 0, 0, retries, timeout)
 
-        # -- prepare request --------------------------------------------------
-        headers = {"Authorization": f"Bearer {api_key}"}
-        payload = self._build_payload(
-            model, clean_prompt, width, height, duration,
-            negative_prompt=negative_prompt or None,
-            fps=fps if fps > 0 else None,
-            n=n,
-            seed=seed if seed > 0 else None,
-            image_data_url=image_data_url,
-        )
+        resp = ZHANGYUAPI_post(f"{base}/kling/v1/videos/image2video", timeout, headers=headers, json=payload)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"API 错误 {resp.status_code}: {_safe_extract_error_from_response(resp)}")
 
-        mode_label = "图生视频" if is_image2video else "文生视频"
-        print(
-            f"[Comfyui-ZhangyuAPI-Kling] mode={mode_label}, model={model}, "
-            f"size={size} ({width}x{height}), duration={duration}s, seed={seed}"
-        )
-        emit_runtime_status(unique_id, "running", f"开始生成视频 · {mode_label}",
-                            0.0, 0, retry_times, timeout_seconds)
+        task_id = resp.json().get("data", {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("未返回 task_id")
 
-        # -- retry loop -------------------------------------------------------
-        last_error = None
-        for attempt in range(1, retry_times + 1):
-            try:
-                emit_runtime_status(
-                    unique_id, "running",
-                    f"{mode_label}请求中 ({attempt}/{retry_times})",
-                    time.time() - start_ts,
-                    attempt, retry_times, timeout_seconds,
-                )
+        task_data = _poll_task(base, headers, task_id, "image2video", timeout - 10, retries)
+        video_url = _extract_video_url(task_data)
+        if not video_url:
+            raise RuntimeError("未返回视频 URL")
 
-                response = self._request_generation(
-                    api_base, headers, payload, is_image2video,
-                    timeout_seconds,
-                )
+        video_bytes = _download_video(video_url, headers, timeout, retries)
+        filepath = _save_video(video_bytes)
+        video_obj = VideoFromFile(filepath) if VideoFromFile else filepath
+        return (video_obj, json.dumps({"status": "success", "task_id": task_id}, ensure_ascii=False), "[]")
 
-                if response.status_code not in (200, 201, 202):
-                    try:
-                        err_data = response.json()
-                        err_msg = _extract_api_error_message(err_data)
-                    except Exception:
-                        err_msg = _safe_extract_error_from_response(response)
-                    last_error = f"Kling API 错误 {response.status_code}: {err_msg}"
-                    if (is_retryable_http_status(response.status_code)
-                            and attempt < retry_times):
-                        emit_runtime_status(
-                            unique_id, "running",
-                            f"API 返回 {response.status_code}，"
-                            f"重试中 ({attempt}/{retry_times})",
-                            time.time() - start_ts,
-                            attempt, retry_times, timeout_seconds,
-                        )
-                        _jittered_sleep(attempt)
-                        continue
-                    raise RuntimeError(last_error)
+    def _multi_image(self, base, headers, prompt, model, aspect_ratio, duration, kling_mode,
+                     seed, timeout, retries, negative_prompt, images, uid):
+        image_list = []
+        for img in images:
+            if img is not None:
+                b64 = _image_to_base64(img)
+                if b64:
+                    image_list.append({"image": b64})
+        if not image_list:
+            raise ValueError("至少需要一张参考图")
 
-                data = response.json()
+        payload = {
+            "model_name": model, "image_list": image_list,
+            "prompt": prompt, "negative_prompt": negative_prompt,
+            "mode": kling_mode, "duration": duration, "aspect_ratio": aspect_ratio,
+        }
+        if seed > 0:
+            payload["seed"] = seed
 
-                # -- Identify task ID -----------------------------------------
-                task_id = (
-                    data.get("task_id")
-                    or data.get("id")
-                    or data.get("video_id")
-                )
-                if not task_id:
-                    raise RuntimeError(
-                        f"Kling API 未返回 task_id: "
-                        f"{json.dumps(_sanitize_api_response(data), ensure_ascii=False)[:500]}"
-                    )
+        if uid:
+            emit_runtime_status(uid, "running", f"可灵多图转视频 ({len(image_list)}张)", 0, 0, retries, timeout)
 
-                # -- Poll until completion ------------------------------------
-                remaining = timeout_seconds - int(time.time() - start_ts)
-                emit_runtime_status(
-                    unique_id, "running",
-                    f"Kling 任务已提交 (id={task_id})，轮询中",
-                    time.time() - start_ts,
-                    attempt, retry_times, timeout_seconds,
-                )
+        resp = ZHANGYUAPI_post(f"{base}/kling/v1/videos/multi-image2video", timeout, headers=headers, json=payload)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"API 错误 {resp.status_code}: {_safe_extract_error_from_response(resp)}")
 
-                def _on_poll_tick(elapsed, poll_elapsed, interval):
-                    emit_runtime_status(
-                        unique_id, "running",
-                        f"轮询 Kling 视频中 · 间隔{interval:.0f}s · "
-                        f"已等待{poll_elapsed:.0f}s",
-                        elapsed,
-                        attempt, retry_times, timeout_seconds,
-                    )
+        task_id = resp.json().get("data", {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("未返回 task_id")
 
-                polled_data = self._poll_kling_task(
-                    api_base, headers, task_id, is_image2video,
-                    remaining, retry_times,
-                    on_tick=_on_poll_tick,
-                )
+        task_data = _poll_task(base, headers, task_id, "multi-image2video", timeout - 10, retries)
+        video_url = _extract_video_url(task_data)
+        if not video_url:
+            raise RuntimeError("未返回视频 URL")
 
-                # -- Download video --------------------------------------------
-                video_url = polled_data.get("url")
-                if not video_url:
-                    raise RuntimeError(
-                        "Kling 任务完成但响应中没有 url 字段"
-                    )
+        video_bytes = _download_video(video_url, headers, timeout, retries)
+        filepath = _save_video(video_bytes, "zhangyuapi_kling_multi")
+        video_obj = VideoFromFile(filepath) if VideoFromFile else filepath
+        return (video_obj, json.dumps({"status": "success", "task_id": task_id}, ensure_ascii=False), "[]")
 
-                emit_runtime_status(
-                    unique_id, "running", "下载视频中",
-                    time.time() - start_ts,
-                    attempt, retry_times, timeout_seconds,
-                )
+    def _extend(self, base, headers, video_id, prompt, timeout, retries, uid):
+        if not video_id:
+            raise ValueError("视频延长模式需要提供 video_id")
 
-                video_bytes = self._download_video_from_url(
-                    video_url, headers, timeout_seconds, retry_times,
-                )
-                filepath = self._save_video(video_bytes, task_id)
+        payload = {"video_id": video_id, "prompt": prompt}
 
-                # -- Build return ----------------------------------------------
-                elapsed = time.time() - start_ts
-                response_info = {
-                    "status": "success",
-                    "format": "Kling",
-                    "mode": mode_label,
-                    "api_base": denormalize_api_base(api_base),
-                    "model": model,
-                    "size": size,
-                    "width": width,
-                    "height": height,
-                    "duration": duration,
-                    "fps": fps if fps > 0 else None,
-                    "seed": seed,
-                    "task_id": task_id,
-                    "video_url": video_url,
-                    "filepath": filepath,
-                    "input_image": image_data_url is not None,
-                    "elapsed_seconds": round(elapsed, 2),
-                }
+        if uid:
+            emit_runtime_status(uid, "running", "可灵视频延长中", 0, 0, retries, timeout)
 
-                emit_runtime_status(
-                    unique_id, "success",
-                    f"视频生成成功 (耗时 {elapsed:.1f}s)",
-                    elapsed, attempt, retry_times, timeout_seconds,
-                )
+        resp = ZHANGYUAPI_post(f"{base}/kling/v1/videos/video-extend", timeout, headers=headers, json=payload)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"API 错误 {resp.status_code}: {_safe_extract_error_from_response(resp)}")
 
-                video_obj = VideoFromFile(filepath) if VideoFromFile is not None else filepath
-                return (
-                    video_obj,
-                    json.dumps(response_info, ensure_ascii=False, indent=2),
-                    json.dumps(model_list, ensure_ascii=False),
-                )
+        task_id = resp.json().get("data", {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("未返回 task_id")
 
-            except _RETRYABLE_EXCEPTIONS as exc:
-                last_error = str(exc)
-                # 始终调用_on_retryable_error来处理连接重置
-                _on_retryable_error(exc)
-                if attempt < retry_times:
-                    emit_runtime_status(
-                        unique_id, "running",
-                        f"网络/超时，重试中 ({attempt}/{retry_times})",
-                        time.time() - start_ts,
-                        attempt, retry_times, timeout_seconds,
-                    )
-                    _jittered_sleep(attempt)
-                    continue
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                emit_runtime_status(
-                    unique_id, "error", last_error,
-                    time.time() - start_ts,
-                    attempt, retry_times, timeout_seconds,
-                )
-                raise
+        task_data = _poll_task(base, headers, task_id, "video-extend", timeout - 10, retries)
+        video_url = _extract_video_url(task_data)
+        if not video_url:
+            raise RuntimeError("未返回视频 URL")
 
-        # -- all retries exhausted --------------------------------------------
-        elapsed = time.time() - start_ts
-        emit_runtime_status(
-            unique_id, "error",
-            f"连续 {retry_times} 次失败",
-            elapsed, retry_times, retry_times, timeout_seconds,
-        )
-        raise RuntimeError(
-            f"Comfyui-ZhangyuAPI-Kling 连续 {retry_times} 次失败，"
-            f"最后错误: {last_error}"
-        )
+        video_bytes = _download_video(video_url, headers, timeout, retries)
+        filepath = _save_video(video_bytes, "zhangyuapi_kling_extend")
+        video_obj = VideoFromFile(filepath) if VideoFromFile else filepath
+        return (video_obj, json.dumps({"status": "success", "task_id": task_id}, ensure_ascii=False), "[]")
+
+    def _lip_sync(self, base, headers, video_id, task_id, text, voice_language,
+                  zh_voice, en_voice, voice_speed, timeout, retries, uid):
+        if not video_id or not task_id:
+            raise ValueError("唇形同步模式需要提供 video_id 和 task_id")
+
+        voice_map = dict(KLING_ZH_VOICES if voice_language == "zh" else KLING_EN_VOICES)
+        voice_name = zh_voice if voice_language == "zh" else en_voice
+        voice_id = voice_map.get(voice_name, "")
+
+        payload = {
+            "input": {
+                "task_id": task_id, "video_id": video_id,
+                "mode": "text2video", "text": text,
+                "voice_id": voice_id, "voice_language": voice_language,
+                "voice_speed": voice_speed,
+            }
+        }
+
+        if uid:
+            emit_runtime_status(uid, "running", "可灵唇形同步中", 0, 0, retries, timeout)
+
+        resp = ZHANGYUAPI_post(f"{base}/kling/v1/videos/lip-sync", timeout, headers=headers, json=payload)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"API 错误 {resp.status_code}: {_safe_extract_error_from_response(resp)}")
+
+        new_task_id = resp.json().get("data", {}).get("task_id")
+        if not new_task_id:
+            raise RuntimeError("未返回 task_id")
+
+        task_data = _poll_task(base, headers, new_task_id, "lip-sync", timeout - 10, retries)
+        video_url = _extract_video_url(task_data)
+        if not video_url:
+            raise RuntimeError("未返回视频 URL")
+
+        video_bytes = _download_video(video_url, headers, timeout, retries)
+        filepath = _save_video(video_bytes, "zhangyuapi_kling_lipsync")
+        video_obj = VideoFromFile(filepath) if VideoFromFile else filepath
+        return (video_obj, json.dumps({"status": "success", "task_id": new_task_id}, ensure_ascii=False), "[]")
 
 
 # ===================================================================
-# ComfyUI node registration
+# Registration
 # ===================================================================
 
 NODE_CLASS_MAPPINGS = {
@@ -653,5 +476,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ComfyuiZhangyuAPIKlingNode": "ComfyUI-zhangyuapi-可灵格式",
+    "ComfyuiZhangyuAPIKlingNode": "ComfyUI-zhangyuapi-可灵视频",
 }
