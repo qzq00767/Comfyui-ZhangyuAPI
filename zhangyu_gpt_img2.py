@@ -8,20 +8,18 @@ compatible Images API (``/v1/images/generations``, ``/v1/images/edits``).
 
 Features:
 - Real size / quality / format / mask controls sent as API parameters.
-- HTTP/1.1 via ``httpx`` with connection pooling and system proxy support.
+- HTTP/1.1 via ``requests`` with connection pooling and system proxy support.
 - Adaptive task polling with four-stage interval escalation.
 - Concurrent async image downloads via ``asyncio.create_task``.
 - Frontend runtime status bar with live progress updates.
 """
 
-import asyncio
 import base64
 import json
 import hashlib
 import os
 import re
 import random
-import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +28,7 @@ from io import BytesIO
 
 import numpy as np
 from PIL import Image
-import httpx
+import requests
 import torch
 
 try:
@@ -56,7 +54,6 @@ _API_BASE_REWRITE = {
 # HTTP client timeouts (seconds)
 DEFAULT_CONNECT_TIMEOUT = 30
 DEFAULT_READ_TIMEOUT = 300
-DEFAULT_POOL_TIMEOUT = 10.0
 
 # Node / widget timeouts (seconds)
 DEFAULT_NODE_TIMEOUT = 360        # widget default
@@ -66,8 +63,6 @@ DEFAULT_MAX_NODE_TIMEOUT = 1800   # widget max
 # Other defaults
 DEFAULT_FETCH_TIMEOUT = 30        # model-fetch route timeout
 DEFAULT_RETRY_TIMES = 5           # default retry count (increased for connection resets)
-DEFAULT_MAX_CONNECTIONS = 5       # httpx connection pool size (减小以避免复用失效连接)
-DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 2  # keepalive connections (减小以避免复用失效连接)
 DEFAULT_USER_AGENT = "Comfyui-ZhangyuAPI/3.0"  # User-Agent header
 
 # Polling stages: (threshold_seconds, interval_seconds)
@@ -83,21 +78,12 @@ _POLL_INTERVAL_STAGES = (
 # Thread-pool for parallel PIL image decoding (CPU-bound).
 _PIL_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 8)))
 
-# httpx exceptions that warrant a retry (transient network / proxy issues)
+# requests exceptions that warrant a retry (transient network / proxy issues)
 _RETRYABLE_EXCEPTIONS = (
-    httpx.TimeoutException,
-    httpx.ConnectError,
-    httpx.ProxyError,
-    httpx.ReadTimeout,
-    httpx.RemoteProtocolError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ProxyError,
 )
-
-# Extend with protocol-level errors that may not exist in older httpx
-for _name in ("LocalProtocolError", "ProtocolError"):
-    _cls = getattr(httpx, _name, None)
-    if _cls is not None and isinstance(_cls, type) and issubclass(_cls, Exception):
-        _RETRYABLE_EXCEPTIONS += (_cls,)
-del _name, _cls
 
 
 class _EmptyDataRetryableError(Exception):
@@ -136,100 +122,36 @@ def _log(level, *args):
 
 
 # ---------------------------------------------------------------------------
-# Per-thread HTTP client — httpx.Client is NOT thread-safe (unlike the old
-# requests.Session).  ComfyUI invokes generate() from a ThreadPoolExecutor, so
-# each thread gets its own client via threading.local().
+# Per-thread HTTP client — simple stateless approach (same as Comfyui-zhenzhen).
+# Each request creates a new connection, no connection pooling.
 # ---------------------------------------------------------------------------
-_HTTP_CLIENT_LOCAL = threading.local()
-
 
 def _get_http_client():
-    """Return (or create) the per-thread ``httpx.Client`` instance.
+    """Return the ``requests`` module for making HTTP calls.
 
-    The client uses HTTP/1.1 with connection pooling.  When a
-    ``RemoteProtocolError`` or ``ConnectError`` occurs during a request,
-    :func:`_on_retryable_error` closes the current client so the next
-    retry creates a fresh TCP + TLS session.
+    Uses stateless approach — each request creates a new connection.
+    This is the same approach as Comfyui-zhenzhen for maximum compatibility.
     """
-    client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
-    if client is None:
-        # 禁用TCP keepalive，避免104连接重置错误
-        # 不设置socket_options，使用系统默认配置
-        
-        # 创建HTTP传输层，不设置socket_options
-        transport = httpx.HTTPTransport(
-            local_address=None,
-        )
-        
-        _HTTP_CLIENT_LOCAL.client = httpx.Client(
-            http2=False,
-            timeout=httpx.Timeout(DEFAULT_CONNECT_TIMEOUT,
-                                  read=DEFAULT_READ_TIMEOUT,
-                                  pool=DEFAULT_POOL_TIMEOUT),
-            limits=httpx.Limits(
-                max_connections=5,  # 减小连接池大小，避免长时间复用失效连接
-                max_keepalive_connections=2,
-            ),
-            trust_env=True,  # 使用系统代理设置，避免网络环境问题
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-            transport=transport,
-        )
-        client = _HTTP_CLIENT_LOCAL.client
-    return client
+    return requests
 
 
 # ---------------------------------------------------------------------------
-# Connection recovery helpers — when a TCP/TLS connection is reset or
-# fails, discard the stale per-thread client so the next attempt gets a
-# fresh connection (new DNS lookup, TCP connect, TLS handshake).
-# _HTTP_CLIENT_FALLBACK is reserved for future HTTP/2 re-enablement.
+# Connection recovery helpers — no-op for stateless approach.
 # ---------------------------------------------------------------------------
 
 def _reset_http_client_for_retry():
-    """Close and discard the current per-thread ``httpx.Client``.
-
-    Call this before retrying after a ``ConnectError`` or
-    ``RemoteProtocolError`` to force a fresh TCP + TLS session.
-    """
-    client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
-    if client is not None:
-        try:
-            client.close()
-        except Exception as exc:
-            _log("debug", f"关闭 HTTP 客户端时出错 (可忽略): {type(exc).__name__}")
-    _HTTP_CLIENT_LOCAL.client = None
+    """No-op for stateless approach — each request is independent."""
+    pass
 
 
 def _on_retryable_error(exc):
     """Handle a retryable exception before the next retry attempt.
 
-    Performs connection-level recovery:
-
-    * ``RemoteProtocolError`` / ``ConnectError``:
-      Discard the per-thread client so the retry creates a new TCP
-      connection and fresh TLS session.  This covers "Connection reset
-      by peer" (errno 104 / WinError 10054) caused by server-side
-      resets, middlebox interference, or stale keepalive connections.
-
-    * Other retryable exceptions (timeout, proxy error, etc.):
-      Only logged — no client reset is performed.
-
-    Callers should invoke this **after** catching a
-    ``_RETRYABLE_EXCEPTIONS`` and **before** ``_jittered_sleep()``.
-
-    Args:
-        exc: The caught exception instance.
+    For stateless approach, we just log the error. No client reset needed.
     """
     exc_type = type(exc).__name__
     exc_msg = str(exc)[:300]
-
-    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ConnectError)):
-        _log("warn",
-             f"{exc_type}，重置 HTTP 客户端以获取全新 TCP+TLS 连接: {exc_msg}")
-        _reset_http_client_for_retry()
-    else:
-        _log("warn",
-             f"可重试异常 (不重置客户端): {exc_type}: {exc_msg}")
+    _log("warn", f"可重试异常: {exc_type}: {exc_msg}")
 
 
 # ===================================================================
@@ -237,14 +159,13 @@ def _on_retryable_error(exc):
 # ===================================================================
 
 def ZHANGYUAPI_timeout(timeout_seconds):
-    """Build an ``httpx.Timeout`` from a user-supplied read timeout.
+    """Build a timeout tuple from a user-supplied read timeout.
 
     Args:
-        timeout_seconds: Desired read timeout in seconds. Clamped
-            indirectly via connect = max(30, min(120, read // 3)).
+        timeout_seconds: Desired read timeout in seconds.
 
     Returns:
-        ``httpx.Timeout`` with dynamic connect + read + fixed pool timeout.
+        ``tuple`` — (connect_timeout, read_timeout) for requests.
 
     """
     try:
@@ -257,25 +178,22 @@ def ZHANGYUAPI_timeout(timeout_seconds):
         read_to = DEFAULT_READ_TIMEOUT
 
     # Connect timeout: clamp to [min(read_to, 10), min(read_to, 30)].
-    # TCP + TLS should never need more than 30 s on modern infrastructure.
-    # Short cap means connection failures fail fast, leaving more time
-    # budget for the actual API request and retries.
     min_connect = min(read_to, 10)
     max_connect = min(read_to, 30)
     connect_to = int(max(min_connect, min(max_connect, read_to // 3)))
-    return httpx.Timeout(connect_to, read=read_to, pool=DEFAULT_POOL_TIMEOUT)
+    return (connect_to, read_to)
 
 
 def ZHANGYUAPI_get(url, timeout_seconds, **kwargs):
-    """GET *url* through the shared HTTP/2 client.
+    """GET *url* through the shared HTTP client.
 
     Args:
         url: Full request URL.
         timeout_seconds: Read timeout passed to :func:`ZHANGYUAPI_timeout`.
-        **kwargs: Forwarded to ``httpx.Client.get``.
+        **kwargs: Forwarded to ``requests.Session.get``.
 
     Returns:
-        ``httpx.Response``.
+        ``requests.Response``.
 
     """
     return _get_http_client().get(
@@ -283,15 +201,15 @@ def ZHANGYUAPI_get(url, timeout_seconds, **kwargs):
 
 
 def ZHANGYUAPI_post(url, timeout_seconds, **kwargs):
-    """POST *url* through the per-thread HTTP/2 client.
+    """POST *url* through the per-thread HTTP client.
 
     Args:
         url: Full request URL.
         timeout_seconds: Read timeout passed to :func:`ZHANGYUAPI_timeout`.
-        **kwargs: Forwarded to ``httpx.Client.post``.
+        **kwargs: Forwarded to ``requests.Session.post``.
 
     Returns:
-        ``httpx.Response``.
+        ``requests.Response``.
 
     """
     return _get_http_client().post(
@@ -888,7 +806,7 @@ def _download_bytes_with_retry(url, headers, timeout_seconds,
         try:
             response = ZHANGYUAPI_get(url, timeout_seconds, headers=headers)
             if not response.is_success:
-                raise httpx.HTTPStatusError(
+                raise requests.exceptions.HTTPError(
                     f"HTTP {response.status_code}",
                     request=response.request,
                     response=response,
@@ -902,7 +820,7 @@ def _download_bytes_with_retry(url, headers, timeout_seconds,
                 time.sleep(_jittered_backoff_seconds(attempt))
                 continue
             break
-        except httpx.HTTPStatusError as exc:
+        except requests.exceptions.HTTPError as exc:
             if is_retryable_http_status(exc.response.status_code):
                 last_error = str(exc)
                 if attempt < retry_times:
@@ -1286,41 +1204,6 @@ def emit_runtime_status(
 
 
 # ===================================================================
-# Async-from-sync bridge
-# ===================================================================
-
-def _run_async_coroutine(coro):
-    """Run an async coroutine from a synchronous (thread-pool) context.
-
-    ComfyUI invokes ``generate()`` inside a ``ThreadPoolExecutor``, so
-    ``asyncio.get_running_loop()`` raises ``RuntimeError`` in that thread.
-    This helper handles both cases transparently.
-
-    When a loop is already running (e.g. ComfyUI's main thread), the
-    coroutine is delegated to a fresh one-shot thread via ``asyncio.run``
-    to avoid event-loop nesting conflicts.
-
-    Args:
-        coro: A coroutine object (result of calling an ``async def`` function).
-
-    Returns:
-        Whatever the coroutine returns.
-
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # No event loop in this thread — safe to use asyncio.run()
-        return asyncio.run(coro)
-
-    # A loop is already running — delegate to a fresh thread to avoid
-    # "Cannot run the event loop while another loop is running" errors.
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
-
-
-# ===================================================================
 # Shared response parsing & image download (used by all image nodes)
 # ===================================================================
 
@@ -1426,7 +1309,7 @@ def _safe_extract_error_from_response(response, max_length=500):
     Falls back to a generic message if parsing fails.
 
     Args:
-        response: ``httpx.Response`` object.
+        response: ``requests.Response`` object.
         max_length: Maximum length of the error message.
 
     Returns:
@@ -1533,11 +1416,10 @@ def _parse_response_images(data, timeout_seconds, error_prefix="API",
 
 def _download_images_async(urls, timeout_seconds,
                            retry_times=DEFAULT_RETRY_TIMES):
-    """Download multiple image URLs concurrently via ``asyncio.create_task()``.
+    """Download multiple image URLs synchronously.
 
-    All downloads share a single ``httpx.AsyncClient`` for connection
-    reuse (HTTP/1.1 keepalive).  PIL decoding is offloaded to
-    :data:`_PIL_EXECUTOR` so CPU work overlaps with remaining network I/O.
+    Uses simple ``requests.get`` for each URL (same as Comfyui-zhenzhen).
+    PIL decoding is done immediately after download.
 
     **Fault-tolerant**: individual image failures are logged and skipped;
     the batch continues as long as at least one image succeeds.
@@ -1565,38 +1447,31 @@ def _download_images_async(urls, timeout_seconds,
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
 
-    async def _download_bytes(client, url):
-        """Download a single URL with jittered-backoff retry → bytes."""
+    def _download_single(url):
+        """Download a single URL with retry → PIL Image."""
         last_error = None
         for attempt in range(1, retry_times + 1):
             try:
-                response = await client.get(url, headers=_ACCEPT_HEADER)
-                if not response.is_success:
-                    raise httpx.HTTPStatusError(
-                        f"HTTP {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                return response.content
+                response = requests.get(url, headers=_ACCEPT_HEADER, timeout=timeout_seconds)
+                response.raise_for_status()
+                return Image.open(BytesIO(response.content))
             except _RETRYABLE_EXCEPTIONS as exc:
                 last_error = str(exc)
                 _log("warn",
                      f"图片下载失败 (attempt={attempt}/{retry_times}, "
                      f"type={type(exc).__name__}): {last_error}")
                 if attempt < retry_times:
-                    await asyncio.sleep(
-                        _jittered_backoff_seconds(attempt))
+                    time.sleep(_jittered_backoff_seconds(attempt))
                     continue
                 break
-            except httpx.HTTPStatusError as exc:
+            except requests.exceptions.HTTPError as exc:
                 if is_retryable_http_status(exc.response.status_code):
                     last_error = str(exc)
                     _log("warn",
-                         f"图片下载 HTTP {exc.response.status_code} "
+                         f"图片下载 HTTP 错误 "
                          f"(attempt={attempt}/{retry_times}): {last_error}")
                     if attempt < retry_times:
-                        await asyncio.sleep(
-                            _jittered_backoff_seconds(attempt))
+                        time.sleep(_jittered_backoff_seconds(attempt))
                         continue
                 raise RuntimeError(
                     f"下载图片失败 (url={url[:200]}): {exc}"
@@ -1606,72 +1481,37 @@ def _download_images_async(urls, timeout_seconds,
             f"(url={url[:200]}): {last_error}"
         )
 
-    async def _download_and_decode(client, url):
-        """Download → immediately decode in thread-pool (pipelined)."""
-        loop = asyncio.get_running_loop()
-        img_bytes = await _download_bytes(client, url)
-        return await loop.run_in_executor(
-            _PIL_EXECUTOR, _image_bytes_to_uint8, img_bytes)
+    tensors = []
+    successful_urls = []
+    failed_count = 0
 
-    async def _gather():
-        req_timeout = ZHANGYUAPI_timeout(timeout_seconds)
-        semaphore = asyncio.Semaphore(10)  # 限制最多10个并发下载
-        
-        async def _download_with_semaphore(client, url):
-            async with semaphore:
-                return await _download_and_decode(client, url)
-        
-        # 禁用TCP keepalive，避免104连接重置错误
-        # 不设置socket_options，使用系统默认配置
-        
-        # 创建HTTP传输层，不设置socket_options
-        transport = httpx.AsyncHTTPTransport(
-            local_address=None,
-        )
-        
-        async with httpx.AsyncClient(
-            http2=False,
-            timeout=req_timeout,
-            trust_env=True,  # 使用系统代理设置，避免网络环境问题
-            follow_redirects=True,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-            transport=transport,
-        ) as client:
-            tasks = [
-                asyncio.create_task(_download_with_semaphore(client, url))
-                for url in urls
-            ]
-            results = await asyncio.gather(
-                *tasks, return_exceptions=True)
-
-        tensors = []
-        successful_urls = []
-        failed_count = 0
-        for idx, r in enumerate(results):
-            if isinstance(r, BaseException):
-                failed_count += 1
-                print(
-                    f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(urls)} 张图"
-                    f" 下载失败，已跳过"
-                    f" (url={urls[idx][:200]}): {r}"
-                )
-                continue
-            tensors.append(r)
-            successful_urls.append(urls[idx])
-
-        if not tensors:
-            raise RuntimeError(
-                f"所有 {len(urls)} 张图片下载均失败，"
-                f"无法继续（可能是网络或远端服务问题）"
-            )
-        if failed_count:
+    for idx, url in enumerate(urls):
+        try:
+            img = _download_single(url)
+            arr = np.array(img)
+            tensor = torch.from_numpy(arr).unsqueeze(0)
+            tensors.append(tensor)
+            successful_urls.append(url)
+        except Exception as exc:
+            failed_count += 1
             print(
-                f"[Comfyui-ZhangyuAPI] 图片下载: {len(tensors)}/{len(urls)} 成功, "
-                f"{failed_count} 张被跳过"
+                f"[Comfyui-ZhangyuAPI] 警告: 第 {idx+1}/{len(urls)} 张图"
+                f" 下载失败，已跳过"
+                f" (url={url[:200]}): {exc}"
             )
-        return tensors, successful_urls
+            continue
 
-    return _run_async_coroutine(_gather())
+    if not tensors:
+        raise RuntimeError(
+            f"所有 {len(urls)} 张图片下载均失败，"
+            f"无法继续（可能是网络或远端服务问题）"
+        )
+    if failed_count:
+        print(
+            f"[Comfyui-ZhangyuAPI] 图片下载: {len(tensors)}/{len(urls)} 成功, "
+            f"{failed_count} 张被跳过"
+        )
+    return tensors, successful_urls
 
 
 # ===================================================================
@@ -1891,7 +1731,7 @@ class ComfyuiZhangyuAPIImage2Node:
             timeout_seconds: Read timeout.
 
         Returns:
-            ``httpx.Response``.
+            ``requests.Response``.
 
         """
         return ZHANGYUAPI_post(
@@ -1914,7 +1754,7 @@ class ComfyuiZhangyuAPIImage2Node:
             timeout_seconds: Read timeout.
 
         Returns:
-            ``httpx.Response``.
+            ``requests.Response``.
 
         """
         files = [

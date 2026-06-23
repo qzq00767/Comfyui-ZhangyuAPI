@@ -19,7 +19,7 @@ import re
 import time
 import uuid
 
-import httpx
+import requests
 
 from .zhangyu_gpt_img2 import (
     ZHANGYUAPI_post,
@@ -242,7 +242,7 @@ def _call_chat_stream(api_base, api_key, model, messages,
     ) as response:
         try:
             response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
+        except requests.exceptions.HTTPError as exc:
             raise RuntimeError(
                 f"API 请求失败: HTTP {response.status_code}; "
                 f"response={_safe_extract_error_from_response(response, 2000)}"
@@ -305,7 +305,7 @@ def _call_chat_nonstream(api_base, api_key, model, messages,
     )
     try:
         response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
+    except requests.exceptions.HTTPError as exc:
         raise RuntimeError(
             f"API 请求失败: HTTP {response.status_code}; response={_safe_extract_error_from_response(response, 2000)}"
         ) from exc
